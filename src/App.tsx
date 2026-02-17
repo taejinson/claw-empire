@@ -106,11 +106,15 @@ export default function App() {
       }),
       on("new_message", (payload: unknown) => {
         const msg = payload as Message;
-        setMessages((prev) => [...prev, msg]);
+        setMessages((prev) =>
+          prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
+        );
       }),
       on("announcement", (payload: unknown) => {
         const msg = payload as Message;
-        setMessages((prev) => [...prev, msg]);
+        setMessages((prev) =>
+          prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
+        );
       }),
       on("cli_output", (payload: unknown) => {
         const p = payload as { task_id: string; stream: string; data: string };
@@ -170,14 +174,15 @@ export default function App() {
   async function handleSendMessage(
     content: string,
     receiverType: "agent" | "department" | "all",
-    receiverId?: string
+    receiverId?: string,
+    messageType?: string
   ) {
     try {
       await api.sendMessage({
         receiver_type: receiverType,
         receiver_id: receiverId,
         content,
-        message_type: "chat",
+        message_type: (messageType as "chat" | "task_assign" | "report") || "chat",
       });
       // Refresh messages
       const msgs = await api.getMessages({
@@ -362,7 +367,14 @@ export default function App() {
               tasks={tasks}
               subAgents={subAgents}
               onSelectAgent={(a) => setSelectedAgent(a)}
-              onSelectDepartment={() => {}}
+              onSelectDepartment={(dept) => {
+                const leader = agents.find(
+                  (a) => a.department_id === dept.id && a.role === "team_leader"
+                );
+                if (leader) {
+                  handleOpenChat(leader);
+                }
+              }}
             />
           )}
 

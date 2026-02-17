@@ -11,20 +11,26 @@ export function useWebSocket() {
   useEffect(() => {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/ws`;
+    let alive = true;
     let ws: WebSocket;
     let reconnectTimer: ReturnType<typeof setTimeout>;
 
     function connect() {
+      if (!alive) return;
       ws = new WebSocket(url);
       wsRef.current = ws;
 
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        if (alive) setConnected(true);
+      };
       ws.onclose = () => {
+        if (!alive) return;
         setConnected(false);
         reconnectTimer = setTimeout(connect, 2000);
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
+        if (!alive) return;
         try {
           const evt: WSEvent = JSON.parse(e.data);
           const listeners = listenersRef.current.get(evt.type);
@@ -37,6 +43,7 @@ export function useWebSocket() {
 
     connect();
     return () => {
+      alive = false;
       clearTimeout(reconnectTimer);
       ws?.close();
     };

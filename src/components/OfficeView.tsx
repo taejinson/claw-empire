@@ -786,7 +786,12 @@ export default function OfficeView({
     }
 
     // Keyboard handlers
+    const isInputFocused = () => {
+      const tag = document.activeElement?.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (document.activeElement as HTMLElement)?.isContentEditable;
+    };
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isInputFocused()) return;
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyW", "KeyA", "KeyS", "KeyD"].includes(e.code)) {
         e.preventDefault();
         keysRef.current[e.code] = true;
@@ -801,7 +806,10 @@ export default function OfficeView({
         }
       }
     };
-    const onKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (isInputFocused()) return;
+      keysRef.current[e.code] = false;
+    };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
 

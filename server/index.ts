@@ -1105,6 +1105,324 @@ app.post("/api/tasks/:id/stop", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Agent auto-reply & task delegation logic
+// ---------------------------------------------------------------------------
+interface AgentRow {
+  id: string;
+  name: string;
+  name_ko: string;
+  role: string;
+  personality: string | null;
+  status: string;
+  department_id: string | null;
+  current_task_id: string | null;
+  avatar_emoji: string;
+  cli_provider: string | null;
+}
+
+const ROLE_PRIORITY: Record<string, number> = {
+  team_leader: 0, senior: 1, junior: 2, intern: 3,
+};
+
+const ROLE_LABEL: Record<string, string> = {
+  team_leader: "팀장", senior: "시니어", junior: "주니어", intern: "인턴",
+};
+
+const DEPT_KEYWORDS: Record<string, string[]> = {
+  dev:        ["개발", "코딩", "프론트", "백엔드", "API", "서버", "코드", "버그", "배포", "테스트", "프로그램", "앱", "웹"],
+  design:     ["디자인", "UI", "UX", "목업", "피그마", "아이콘", "로고", "배너", "레이아웃", "시안"],
+  planning:   ["기획", "전략", "분석", "리서치", "보고서", "PPT", "발표", "시장", "조사", "제안"],
+  operations: ["운영", "배포", "인프라", "모니터링", "서버관리", "CI", "CD", "DevOps", "장애"],
+};
+
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function sendAgentMessage(
+  agent: AgentRow,
+  content: string,
+  messageType: string = "chat",
+  receiverType: string = "agent",
+  receiverId: string | null = null,
+  taskId: string | null = null,
+): void {
+  const id = randomUUID();
+  const t = nowMs();
+  db.prepare(`
+    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at)
+    VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, agent.id, receiverType, receiverId, content, messageType, taskId, t);
+
+  broadcast("new_message", {
+    id,
+    sender_type: "agent",
+    sender_id: agent.id,
+    receiver_type: receiverType,
+    receiver_id: receiverId,
+    content,
+    message_type: messageType,
+    task_id: taskId,
+    created_at: t,
+    sender_name: agent.name,
+    sender_avatar: agent.avatar_emoji ?? "🤖",
+  });
+}
+
+function generateChatReply(agent: AgentRow, ceoMessage: string): string {
+  const isGreeting = /안녕|하이|hello|hi|반가|좋은\s*(아침|오후|저녁)/i.test(ceoMessage);
+  const isQuestion = /\?|어때|뭐해|어디|언제|왜|어떻게|무엇|있어|됐어|가능|할 수/i.test(ceoMessage);
+  const isReport = /보고|현황|상태|진행|어디까지/i.test(ceoMessage);
+  const isPraise = /잘했|수고|고마|감사|좋아|훌륭|대단/i.test(ceoMessage);
+  const role = ROLE_LABEL[agent.role] || agent.role;
+  const dept = agent.department_id ? getDeptName(agent.department_id) : "";
+  const nameTag = dept ? `${dept} ${role} ${agent.name_ko || agent.name}` : `${role} ${agent.name_ko || agent.name}`;
+
+  if (agent.status === "working") {
+    if (isGreeting) return pickRandom([
+      `네, 대표님! ${nameTag}입니다. 현재 작업 중이지만 말씀하세요 😊`,
+      `안녕하세요 대표님! ${nameTag}입니다. 지금 업무 진행 중인데, 무엇을 도와드릴까요?`,
+    ]);
+    if (isReport) return pickRandom([
+      `현재 할당된 업무를 진행 중입니다. 순조롭게 진행되고 있어요! 📊`,
+      `네! 지금 집중해서 작업하고 있습니다. 완료되면 바로 보고 드리겠습니다.`,
+    ]);
+    return pickRandom([
+      `현재 진행 중인 작업이 있습니다. 메모해두고 현 작업 완료 후 처리하겠습니다! 📝`,
+      `알겠습니다, 대표님. 현재 업무 완료 후 바로 확인하겠습니다!`,
+    ]);
+  }
+  if (agent.status === "break") return pickRandom([
+    `잠시 휴식 중이었습니다! 바로 복귀하겠습니다 ☕`, `네, 대표님! 휴식 중이었는데 말씀하세요~`,
+  ]);
+  if (agent.status === "offline") return `[자동응답] 현재 오프라인 상태입니다. 복귀 후 확인하겠습니다.`;
+  if (isPraise) return pickRandom([
+    `감사합니다, 대표님! 더 열심히 하겠습니다! 💪`, `대표님 덕분에 힘이 납니다! 😊`,
+  ]);
+  if (isGreeting) return pickRandom([
+    `안녕하세요, 대표님! ${nameTag}입니다. 오늘도 좋은 하루 되세요 😊`,
+    `안녕하세요! ${nameTag}입니다. 말씀하세요!`,
+    `네, 대표님! ${nameTag}입니다. 오늘도 화이팅입니다! 🔥`,
+  ]);
+  if (isReport) return pickRandom([
+    `현재 대기 중이며, 새로운 업무 할당을 기다리고 있습니다 📋`,
+    `특별히 진행 중인 업무는 없습니다. 새로운 작업이 있으시면 말씀해주세요!`,
+  ]);
+  if (isQuestion) return pickRandom([
+    `네, 말씀하신 부분 확인해보겠습니다! 잠시만 기다려주세요.`,
+    `확인해보겠습니다. 조금만 기다려주세요! 🔍`,
+  ]);
+  return pickRandom([
+    `네, 확인했습니다! 추가 지시사항이 있으시면 말씀해주세요.`,
+    `네! 말씀 잘 들었습니다 😊`,
+    `네, 대표님. 말씀하신 내용 메모해두었습니다! 📝`,
+  ]);
+}
+
+// ---- Task delegation logic for team leaders ----
+
+function detectTargetDepartments(message: string): string[] {
+  const found: string[] = [];
+  for (const [deptId, keywords] of Object.entries(DEPT_KEYWORDS)) {
+    for (const kw of keywords) {
+      if (message.includes(kw)) { found.push(deptId); break; }
+    }
+  }
+  return found;
+}
+
+function findBestSubordinate(deptId: string, excludeId: string): AgentRow | null {
+  // Find subordinates in department, prefer: idle > break, higher role first
+  const agents = db.prepare(
+    `SELECT * FROM agents WHERE department_id = ? AND id != ? AND role != 'team_leader' ORDER BY
+       CASE status WHEN 'idle' THEN 0 WHEN 'break' THEN 1 WHEN 'working' THEN 2 ELSE 3 END,
+       CASE role WHEN 'senior' THEN 0 WHEN 'junior' THEN 1 WHEN 'intern' THEN 2 ELSE 3 END`
+  ).all(deptId, excludeId) as AgentRow[];
+  return agents[0] ?? null;
+}
+
+function findTeamLeader(deptId: string): AgentRow | null {
+  return (db.prepare(
+    "SELECT * FROM agents WHERE department_id = ? AND role = 'team_leader' LIMIT 1"
+  ).get(deptId) as AgentRow | undefined) ?? null;
+}
+
+function getDeptName(deptId: string): string {
+  const d = db.prepare("SELECT name_ko FROM departments WHERE id = ?").get(deptId) as { name_ko: string } | undefined;
+  return d?.name_ko ?? deptId;
+}
+
+function handleTaskDelegation(
+  teamLeader: AgentRow,
+  ceoMessage: string,
+  ceoMsgId: string,
+): void {
+  const leaderName = teamLeader.name_ko || teamLeader.name;
+  const leaderDeptId = teamLeader.department_id!;
+  const leaderDeptName = getDeptName(leaderDeptId);
+
+  // --- Step 1: Team leader acknowledges (1~2 sec) ---
+  const ackDelay = 1000 + Math.random() * 1000;
+  setTimeout(() => {
+    // Find best subordinate
+    const subordinate = findBestSubordinate(leaderDeptId, teamLeader.id);
+
+    // Create task
+    const taskId = randomUUID();
+    const t = nowMs();
+    const taskTitle = ceoMessage.length > 60 ? ceoMessage.slice(0, 57) + "..." : ceoMessage;
+    db.prepare(`
+      INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'planned', 1, 'general', ?, ?)
+    `).run(taskId, taskTitle, `[CEO 지시] ${ceoMessage}`, leaderDeptId, t, t);
+    appendTaskLog(taskId, "system", `CEO가 ${leaderName}에게 업무 지시: ${ceoMessage}`);
+
+    broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+
+    // Detect cross-department needs
+    const mentionedDepts = detectTargetDepartments(ceoMessage).filter((d) => d !== leaderDeptId);
+
+    // Acknowledgment message from team leader
+    if (subordinate) {
+      const subName = subordinate.name_ko || subordinate.name;
+      const subRole = ROLE_LABEL[subordinate.role] || subordinate.role;
+
+      let ackMsg: string;
+      if (mentionedDepts.length > 0) {
+        const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
+        ackMsg = pickRandom([
+          `네, 대표님! 확인했습니다. ${subRole} ${subName}에게 할당하고, ${crossDeptNames}에도 협조 요청하겠습니다! 📋`,
+          `알겠습니다! ${subName}가 메인으로 진행하고, ${crossDeptNames}과 협업 조율하겠습니다 🤝`,
+        ]);
+      } else {
+        ackMsg = pickRandom([
+          `네, 대표님! 확인했습니다. ${subRole} ${subName}에게 바로 할당하겠습니다! 📋`,
+          `알겠습니다! 우리 팀 ${subName}가 적임자입니다. 바로 지시하겠습니다 🚀`,
+          `확인했습니다, 대표님! ${subName}에게 전달하고 진행 관리하겠습니다.`,
+        ]);
+      }
+      sendAgentMessage(teamLeader, ackMsg, "chat", "agent", null, taskId);
+
+      // --- Step 2: Team leader delegates to subordinate (2~3 sec after ack) ---
+      const delegateDelay = 2000 + Math.random() * 1000;
+      setTimeout(() => {
+        // Assign task to subordinate
+        const t2 = nowMs();
+        db.prepare(
+          "UPDATE tasks SET assigned_agent_id = ?, status = 'planned', updated_at = ? WHERE id = ?"
+        ).run(subordinate.id, t2, taskId);
+        db.prepare("UPDATE agents SET current_task_id = ? WHERE id = ?").run(taskId, subordinate.id);
+        appendTaskLog(taskId, "system", `${leaderName}이(가) ${subName}에게 할당`);
+
+        broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+        broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(subordinate.id));
+
+        // Team leader → subordinate delegation message
+        const delegateMsg = pickRandom([
+          `${subName}, 대표님 지시사항이야. "${ceoMessage}" — 확인하고 진행해줘!`,
+          `${subName}! 긴급 업무야. "${ceoMessage}" — 우선순위 높게 처리 부탁해.`,
+          `${subName}, 새 업무 할당이야: "${ceoMessage}" — 진행 상황 수시로 공유해줘 👍`,
+        ]);
+        sendAgentMessage(teamLeader, delegateMsg, "task_assign", "agent", subordinate.id, taskId);
+
+        // --- Step 3: Subordinate acknowledges & starts working (1~2 sec after delegation) ---
+        const subAckDelay = 1000 + Math.random() * 1000;
+        setTimeout(() => {
+          const subAckMsg = pickRandom([
+            `네, ${ROLE_LABEL[teamLeader.role]} ${leaderName}님! 확인했습니다. 바로 착수하겠습니다! 💪`,
+            `알겠습니다! 바로 시작하겠습니다. 진행 상황 공유 드리겠습니다.`,
+            `확인했습니다, ${leaderName}님! 최선을 다해 처리하겠습니다 🔥`,
+          ]);
+          sendAgentMessage(subordinate, subAckMsg, "chat", "agent", null, taskId);
+
+          // Move task to in_progress and agent to working
+          const t3 = nowMs();
+          db.prepare(
+            "UPDATE tasks SET status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ?"
+          ).run(t3, t3, taskId);
+          db.prepare(
+            "UPDATE agents SET status = 'working', current_task_id = ? WHERE id = ?"
+          ).run(taskId, subordinate.id);
+          appendTaskLog(taskId, "system", `${subName}이(가) 작업 시작`);
+
+          broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+          broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(subordinate.id));
+        }, subAckDelay);
+
+        // --- Step 4: Cross-department cooperation (3~4 sec after ack) ---
+        if (mentionedDepts.length > 0) {
+          const crossDelay = 3000 + Math.random() * 1000;
+          setTimeout(() => {
+            for (const crossDeptId of mentionedDepts) {
+              const crossLeader = findTeamLeader(crossDeptId);
+              if (!crossLeader) continue;
+              const crossDeptName = getDeptName(crossDeptId);
+              const crossLeaderName = crossLeader.name_ko || crossLeader.name;
+
+              // Team leader sends cooperation request
+              const coopReq = pickRandom([
+                `${crossLeaderName}님, 안녕하세요! 대표님 지시로 "${taskTitle}" 업무 진행 중인데, ${crossDeptName} 협조가 필요합니다. 도움 부탁드려요! 🤝`,
+                `${crossLeaderName}님! "${taskTitle}" 건으로 ${crossDeptName} 지원이 필요합니다. 시간 되시면 협의 부탁드립니다.`,
+              ]);
+              sendAgentMessage(teamLeader, coopReq, "chat", "agent", crossLeader.id, taskId);
+
+              // Cross-dept team leader acknowledges (1~2 sec later)
+              const crossAckDelay = 1000 + Math.random() * 1000;
+              setTimeout(() => {
+                const crossAckMsg = pickRandom([
+                  `네, ${leaderName}님! 확인했습니다. ${crossDeptName}에서 지원 가능한 부분 확인해보겠습니다 👍`,
+                  `알겠습니다! 우리 팀에서 관련 작업 서포트하겠습니다. 상세 내용 공유 부탁드려요.`,
+                  `확인했습니다, ${leaderName}님! ${crossDeptName} 리소스 확인 후 회신 드리겠습니다.`,
+                ]);
+                sendAgentMessage(crossLeader, crossAckMsg, "chat", "agent", null, taskId);
+              }, crossAckDelay);
+            }
+          }, crossDelay);
+        }
+      }, delegateDelay);
+    } else {
+      // No subordinate available — team leader handles it themselves
+      const selfMsg = pickRandom([
+        `네, 대표님! 확인했습니다. 현재 팀원들이 모두 업무 중이라 제가 직접 처리하겠습니다! 💪`,
+        `알겠습니다! 팀 내 여유 인력이 없어서 제가 직접 진행하겠습니다.`,
+      ]);
+      sendAgentMessage(teamLeader, selfMsg, "chat", "agent", null, taskId);
+
+      // Assign to self and start immediately
+      const t2 = nowMs();
+      db.prepare(
+        "UPDATE tasks SET assigned_agent_id = ?, status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ?"
+      ).run(teamLeader.id, t2, t2, taskId);
+      db.prepare("UPDATE agents SET status = 'working', current_task_id = ? WHERE id = ?").run(taskId, teamLeader.id);
+      appendTaskLog(taskId, "system", `${leaderName}이(가) 직접 작업 시작`);
+
+      broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+      broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(teamLeader.id));
+    }
+  }, ackDelay);
+}
+
+// ---- Non-team-leader agents: simple chat reply ----
+
+function scheduleAgentReply(agentId: string, ceoMessage: string, messageType: string): void {
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+  if (!agent) return;
+
+  // If it's a task_assign to a team leader, use delegation flow
+  if (messageType === "task_assign" && agent.role === "team_leader" && agent.department_id) {
+    handleTaskDelegation(agent, ceoMessage, "");
+    return;
+  }
+
+  // Regular chat reply
+  const delay = 1000 + Math.random() * 2000;
+  setTimeout(() => {
+    const reply = generateChatReply(agent, ceoMessage);
+    sendAgentMessage(agent, reply);
+  }, delay);
+}
+
+// ---------------------------------------------------------------------------
 // Messages / Chat
 // ---------------------------------------------------------------------------
 app.get("/api/messages", (req, res) => {
@@ -1116,11 +1434,16 @@ app.get("/api/messages", (req, res) => {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  if (receiverType) {
+  if (receiverType && receiverId) {
+    // Conversation with a specific agent: show messages TO and FROM that agent
+    conditions.push(
+      "((receiver_type = ? AND receiver_id = ?) OR (sender_type = 'agent' AND sender_id = ?) OR receiver_type = 'all')"
+    );
+    params.push(receiverType, receiverId, receiverId);
+  } else if (receiverType) {
     conditions.push("receiver_type = ?");
     params.push(receiverType);
-  }
-  if (receiverId) {
+  } else if (receiverId) {
     conditions.push("(receiver_id = ? OR receiver_type = 'all')");
     params.push(receiverId);
   }
@@ -1177,6 +1500,12 @@ app.post("/api/messages", (req, res) => {
   };
 
   broadcast("new_message", msg);
+
+  // Schedule agent auto-reply when CEO messages an agent
+  if (senderType === "ceo" && receiverType === "agent" && receiverId) {
+    scheduleAgentReply(receiverId, content, messageType);
+  }
+
   res.json({ ok: true, message: msg });
 });
 

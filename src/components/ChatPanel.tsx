@@ -5,7 +5,7 @@ interface ChatPanelProps {
   selectedAgent: Agent | null;
   messages: Message[];
   agents: Agent[];
-  onSendMessage: (content: string, receiverType: 'agent' | 'department' | 'all', receiverId?: string) => void;
+  onSendMessage: (content: string, receiverType: 'agent' | 'department' | 'all', receiverId?: string, messageType?: string) => void;
   onSendAnnouncement: (content: string) => void;
   onClose: () => void;
 }
@@ -95,11 +95,11 @@ export function ChatPanel({
     if (mode === 'announcement') {
       onSendAnnouncement(trimmed);
     } else if (mode === 'task' && selectedAgent) {
-      onSendMessage(trimmed, 'agent', selectedAgent.id);
+      onSendMessage(trimmed, 'agent', selectedAgent.id, 'task_assign');
     } else if (mode === 'report' && selectedAgent) {
-      onSendMessage(`[보고 요청] ${trimmed}`, 'agent', selectedAgent.id);
+      onSendMessage(`[보고 요청] ${trimmed}`, 'agent', selectedAgent.id, 'report');
     } else if (selectedAgent) {
-      onSendMessage(trimmed, 'agent', selectedAgent.id);
+      onSendMessage(trimmed, 'agent', selectedAgent.id, 'chat');
     } else {
       onSendMessage(trimmed, 'all');
     }
@@ -109,7 +109,7 @@ export function ChatPanel({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSend();
     }
