@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS departments (
   icon TEXT NOT NULL,
   color TEXT NOT NULL,
   description TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 99,
   created_at INTEGER DEFAULT (unixepoch()*1000)
 );
 
@@ -220,12 +221,15 @@ const deptCount = (db.prepare("SELECT COUNT(*) as cnt FROM departments").get() a
 
 if (deptCount === 0) {
   const insertDept = db.prepare(
-    "INSERT INTO departments (id, name, name_ko, icon, color) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO departments (id, name, name_ko, icon, color, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
   );
-  insertDept.run("dev", "Development", "개발팀", "💻", "#3b82f6");
-  insertDept.run("design", "Design", "디자인팀", "🎨", "#8b5cf6");
-  insertDept.run("planning", "Planning", "기획팀", "📊", "#f59e0b");
-  insertDept.run("operations", "Operations", "운영팀", "⚙️", "#10b981");
+  // Workflow order: 기획 → 개발 → 디자인 → QA → 인프라보안 → 운영
+  insertDept.run("planning",  "Planning",    "기획팀",     "📊", "#f59e0b", 1);
+  insertDept.run("dev",       "Development", "개발팀",     "💻", "#3b82f6", 2);
+  insertDept.run("design",    "Design",      "디자인팀",   "🎨", "#8b5cf6", 3);
+  insertDept.run("qa",        "QA/QC",       "품질관리팀", "🔍", "#ef4444", 4);
+  insertDept.run("devsecops", "DevSecOps",   "인프라보안팀","🛡️", "#f97316", 5);
+  insertDept.run("operations","Operations",  "운영팀",     "⚙️", "#10b981", 6);
   console.log("[CLImpire] Seeded default departments");
 }
 
@@ -236,13 +240,73 @@ if (agentCount === 0) {
     `INSERT INTO agents (id, name, name_ko, department_id, role, cli_provider, avatar_emoji, personality)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
+  // Development (3)
   insertAgent.run(randomUUID(), "Aria",  "아리아", "dev",        "team_leader", "claude",   "👩‍💻", "꼼꼼한 시니어 개발자");
   insertAgent.run(randomUUID(), "Bolt",  "볼트",   "dev",        "senior",      "codex",    "⚡",   "빠른 코딩 전문가");
   insertAgent.run(randomUUID(), "Nova",  "노바",   "dev",        "junior",      "gemini",   "🌟",   "창의적인 주니어");
+  // Design (2)
   insertAgent.run(randomUUID(), "Pixel", "픽셀",   "design",     "team_leader", "claude",   "🎨",   "디자인 리더");
+  insertAgent.run(randomUUID(), "Luna",  "루나",   "design",     "junior",      "gemini",   "🌙",   "감성적인 UI 디자이너");
+  // Planning (2)
   insertAgent.run(randomUUID(), "Sage",  "세이지", "planning",   "team_leader", "opencode", "🧠",   "전략 분석가");
+  insertAgent.run(randomUUID(), "Clio",  "클리오", "planning",   "senior",      "claude",   "📝",   "데이터 기반 기획자");
+  // Operations (2)
   insertAgent.run(randomUUID(), "Atlas", "아틀라스","operations", "team_leader", "claude",   "🗺️",  "운영의 달인");
+  insertAgent.run(randomUUID(), "Turbo", "터보",   "operations", "senior",      "codex",    "🚀",   "자동화 전문가");
+  // QA/QC (2)
+  insertAgent.run(randomUUID(), "Hawk",  "호크",   "qa",         "team_leader", "claude",   "🦅",   "날카로운 품질 감시자");
+  insertAgent.run(randomUUID(), "Lint",  "린트",   "qa",         "senior",      "opencode", "🔬",   "꼼꼼한 테스트 전문가");
+  // DevSecOps (2)
+  insertAgent.run(randomUUID(), "Vault", "볼트S",  "devsecops",  "team_leader", "claude",   "🛡️",  "보안 아키텍트");
+  insertAgent.run(randomUUID(), "Pipe",  "파이프", "devsecops",  "senior",      "codex",    "🔧",   "CI/CD 파이프라인 전문가");
   console.log("[CLImpire] Seeded default agents");
+}
+
+// Migrate: add sort_order column & set correct ordering for existing DBs
+{
+  try { db.exec("ALTER TABLE departments ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 99"); } catch { /* already exists */ }
+
+  const DEPT_ORDER: Record<string, number> = { planning: 1, dev: 2, design: 3, qa: 4, devsecops: 5, operations: 6 };
+  const updateOrder = db.prepare("UPDATE departments SET sort_order = ? WHERE id = ?");
+  for (const [id, order] of Object.entries(DEPT_ORDER)) {
+    updateOrder.run(order, id);
+  }
+
+  const insertDeptIfMissing = db.prepare(
+    "INSERT OR IGNORE INTO departments (id, name, name_ko, icon, color, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+  insertDeptIfMissing.run("qa", "QA/QC", "품질관리팀", "🔍", "#ef4444", 4);
+  insertDeptIfMissing.run("devsecops", "DevSecOps", "인프라보안팀", "🛡️", "#f97316", 5);
+
+  const insertAgentIfMissing = db.prepare(
+    `INSERT OR IGNORE INTO agents (id, name, name_ko, department_id, role, cli_provider, avatar_emoji, personality)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  // Check which agents exist by name to avoid duplicates
+  const existingNames = new Set(
+    (db.prepare("SELECT name FROM agents").all() as { name: string }[]).map((r) => r.name)
+  );
+
+  const newAgents: [string, string, string, string, string, string, string][] = [
+    // [name, name_ko, dept, role, provider, emoji, personality]
+    ["Luna",  "루나",   "design",     "junior",      "gemini",   "🌙",  "감성적인 UI 디자이너"],
+    ["Clio",  "클리오", "planning",   "senior",      "claude",   "📝",  "데이터 기반 기획자"],
+    ["Turbo", "터보",   "operations", "senior",      "codex",    "🚀",  "자동화 전문가"],
+    ["Hawk",  "호크",   "qa",         "team_leader", "claude",   "🦅",  "날카로운 품질 감시자"],
+    ["Lint",  "린트",   "qa",         "senior",      "opencode", "🔬",  "꼼꼼한 테스트 전문가"],
+    ["Vault", "볼트S",  "devsecops",  "team_leader", "claude",   "🛡️", "보안 아키텍트"],
+    ["Pipe",  "파이프", "devsecops",  "senior",      "codex",    "🔧",  "CI/CD 파이프라인 전문가"],
+  ];
+
+  let added = 0;
+  for (const [name, nameKo, dept, role, provider, emoji, personality] of newAgents) {
+    if (!existingNames.has(name)) {
+      insertAgentIfMissing.run(randomUUID(), name, nameKo, dept, role, provider, emoji, personality);
+      added++;
+    }
+  }
+  if (added > 0) console.log(`[CLImpire] Added ${added} new agents`);
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +664,7 @@ app.get("/api/departments", (_req, res) => {
     SELECT d.*,
       (SELECT COUNT(*) FROM agents a WHERE a.department_id = d.id) AS agent_count
     FROM departments d
-    ORDER BY d.created_at ASC
+    ORDER BY d.sort_order ASC
   `).all();
   res.json({ departments });
 });
@@ -1129,10 +1193,12 @@ const ROLE_LABEL: Record<string, string> = {
 };
 
 const DEPT_KEYWORDS: Record<string, string[]> = {
-  dev:        ["개발", "코딩", "프론트", "백엔드", "API", "서버", "코드", "버그", "배포", "테스트", "프로그램", "앱", "웹"],
+  dev:        ["개발", "코딩", "프론트", "백엔드", "API", "서버", "코드", "버그", "프로그램", "앱", "웹"],
   design:     ["디자인", "UI", "UX", "목업", "피그마", "아이콘", "로고", "배너", "레이아웃", "시안"],
   planning:   ["기획", "전략", "분석", "리서치", "보고서", "PPT", "발표", "시장", "조사", "제안"],
   operations: ["운영", "배포", "인프라", "모니터링", "서버관리", "CI", "CD", "DevOps", "장애"],
+  qa:         ["QA", "QC", "품질", "테스트", "검수", "버그리포트", "회귀", "자동화테스트", "성능테스트", "리뷰"],
+  devsecops:  ["보안", "취약점", "인증", "SSL", "방화벽", "해킹", "침투", "파이프라인", "컨테이너", "도커", "쿠버네티스", "암호화"],
 };
 
 function pickRandom<T>(arr: T[]): T {

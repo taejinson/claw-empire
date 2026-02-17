@@ -54,7 +54,7 @@ interface RoomRect {
 /*  Constants                                                          */
 /* ================================================================== */
 
-const OFFICE_W = 820;
+const MIN_OFFICE_W = 820;
 const CEO_ZONE_H = 110;
 const HALLWAY_H = 32;
 const TARGET_CHAR_H = 52;
@@ -78,6 +78,8 @@ const DEPT_THEME: Record<
   design: { floor1: 0x281e4a, floor2: 0x30265a, wall: 0x4a2a7a, accent: 0x8b5cf6 },
   planning: { floor1: 0x2e2810, floor2: 0x38321a, wall: 0x7a6a2a, accent: 0xf59e0b },
   operations: { floor1: 0x142e22, floor2: 0x1a382a, wall: 0x2a7a4a, accent: 0x10b981 },
+  qa: { floor1: 0x2e1414, floor2: 0x381a1a, wall: 0x7a2a2a, accent: 0xef4444 },
+  devsecops: { floor1: 0x2e1e0e, floor2: 0x382816, wall: 0x7a4a1a, accent: 0xf97316 },
 };
 
 function hashStr(s: string): number {
@@ -221,6 +223,7 @@ export default function OfficeView({
   const prevAssignRef = useRef<Set<string>>(new Set());
   const agentPosRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const totalHRef = useRef(600);
+  const officeWRef = useRef(MIN_OFFICE_W);
 
   // Latest data via refs (avoids stale closures)
   const dataRef = useRef({ departments, agents, tasks, subAgents });
@@ -241,15 +244,31 @@ export default function OfficeView({
 
     const { departments, agents, tasks, subAgents } = dataRef.current;
 
-    // Layout
-    const gridCols = Math.min(departments.length || 1, 2);
-    const gridRows = Math.ceil((departments.length || 1) / gridCols);
+    // Assign unique sprite numbers to each agent (1-12, no duplicates)
+    const spriteMap = new Map<string, number>();
+    const allAgents = [...agents].sort((a, b) => a.id.localeCompare(b.id)); // stable order
+    allAgents.forEach((a, i) => spriteMap.set(a.id, (i % 12) + 1));
+
+    // Measure container width for responsive layout
+    const OFFICE_W = officeWRef.current;
+
+    // Layout: fit as many columns as possible (3 for 6 depts)
+    const deptCount = departments.length || 1;
+    const baseRoomW = COLS_PER_ROW * SLOT_W + ROOM_PAD * 2;
+    const roomGap = 12;
+    // Try 3 cols, fall back to 2, then 1
+    let gridCols = Math.min(deptCount, 3);
+    while (gridCols > 1 && (gridCols * baseRoomW + (gridCols - 1) * roomGap + 24) > OFFICE_W) {
+      gridCols--;
+    }
+    const gridRows = Math.ceil(deptCount / gridCols);
     const agentsPerDept = departments.map(d => agents.filter(a => a.department_id === d.id));
     const maxAgents = Math.max(1, ...agentsPerDept.map(a => a.length));
     const agentRows = Math.ceil(maxAgents / COLS_PER_ROW);
-    const roomW = COLS_PER_ROW * SLOT_W + ROOM_PAD * 2;
+    // Scale rooms to fill available width
+    const totalRoomSpace = OFFICE_W - 24 - (gridCols - 1) * roomGap;
+    const roomW = Math.max(baseRoomW, Math.floor(totalRoomSpace / gridCols));
     const roomH = Math.max(170, agentRows * SLOT_H + 44);
-    const roomGap = 12;
     const deptStartY = CEO_ZONE_H + HALLWAY_H;
     const totalH = deptStartY + gridRows * (roomH + roomGap) + 30;
     const roomStartX = (OFFICE_W - (gridCols * roomW + (gridCols - 1) * roomGap)) / 2;
@@ -457,8 +476,7 @@ export default function OfficeView({
         drawChair(room, ax, charFeetY - TARGET_CHAR_H * 0.18, theme.accent);
 
         // ── Character sprite (facing down → toward desk below) ──
-        const charHash = hashStr(agent.id);
-        const spriteNum = (charHash % 12) + 1;
+        const spriteNum = spriteMap.get(agent.id) ?? ((hashStr(agent.id) % 12) + 1);
         const charContainer = new Container();
         charContainer.position.set(ax, charFeetY);
         charContainer.eventMode = "static";
@@ -658,9 +676,12 @@ export default function OfficeView({
       if (!el) return;
       TextureStyle.defaultOptions.scaleMode = "nearest";
 
+      // Measure container for responsive width
+      officeWRef.current = Math.max(MIN_OFFICE_W, el.clientWidth);
+
       const app = new Application();
       await app.init({
-        width: OFFICE_W,
+        width: officeWRef.current,
         height: 600,
         backgroundAlpha: 0,
         antialias: false,
@@ -708,7 +729,7 @@ export default function OfficeView({
           if (keys["ArrowUp"] || keys["KeyW"]) dy -= CEO_SPEED;
           if (keys["ArrowDown"] || keys["KeyS"]) dy += CEO_SPEED;
           if (dx || dy) {
-            ceoPosRef.current.x = Math.max(28, Math.min(OFFICE_W - 28, ceoPosRef.current.x + dx));
+            ceoPosRef.current.x = Math.max(28, Math.min(officeWRef.current - 28, ceoPosRef.current.x + dx));
             ceoPosRef.current.y = Math.max(18, Math.min(totalHRef.current - 28, ceoPosRef.current.y + dy));
             ceo.position.set(ceoPosRef.current.x, ceoPosRef.current.y);
           }
@@ -815,8 +836,21 @@ export default function OfficeView({
 
     init();
 
+    // Resize observer for responsive layout
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry || !appRef.current || destroyedRef.current) return;
+      const newW = Math.max(MIN_OFFICE_W, Math.floor(entry.contentRect.width));
+      if (Math.abs(newW - officeWRef.current) > 10) {
+        officeWRef.current = newW;
+        buildScene();
+      }
+    });
+    if (el) ro.observe(el);
+
     return () => {
       destroyedRef.current = true;
+      ro.disconnect();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       if (appRef.current) {

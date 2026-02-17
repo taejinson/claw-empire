@@ -6,6 +6,7 @@ export interface Department {
   icon: string;
   color: string;
   description: string | null;
+  sort_order: number;
   created_at: number;
   agent_count?: number;
 }
