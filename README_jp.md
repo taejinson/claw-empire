@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ppublic/claw-empire.svg" width="80" alt="Claw-Empire" />
+  <img src="public/claw-empire.svg" width="80" alt="Claw-Empire" />
 </p>
 
 <h1 align="center">Claw-Empire</h1>
@@ -49,6 +49,19 @@ Claw-EmpireはCLIベースのAIコーディングアシスタント — **Claude
 - **ローカルファースト＆プライバシー保護** — すべてのデータはローカルに保存。SQLiteデータベースを使用し、クラウド依存ゼロ
 - **直感的なビジュアル体験** — ピクセルアートのオフィスビューがAIオーケストレーションを楽しく、わかりやすく表現
 - **真の自律コラボレーション** — エージェントは独立したgit worktreeで作業し、会議に参加して成果物を生み出す
+
+---
+
+## AIでインストール
+
+> **以下をAIコーディングエージェント（Claude Code、Codex、Gemini CLI等）に貼り付けるだけです：**
+>
+> ```
+> Install Claw-Empire following the guide at:
+> https://github.com/GreenSheep01201/claw-empire
+> ```
+>
+> AIがこのREADMEを読んで自動的にすべてを処理します。
 
 ---
 
@@ -149,20 +162,7 @@ Claw-EmpireはCLIベースのAIコーディングアシスタント — **Claude
 | **ルーティング** | React Router 7 |
 | **エクスポート** | PptxGenJS（PowerPoint生成） |
 
----
-
-## AIでインストール
-
-> **以下をAIコーディングエージェント（Claude Code、Codex、Gemini CLI等）に貼り付けるだけです：**
->
-> ```
-> Install Claw-Empire following the guide at:
-> https://github.com/GreenSheepStudio/claw-empire
-> ```
->
-> AIがこのREADMEを読んで自動的にすべてを処理します。
-
-<a id="ai-installation-guide"></a>
+<a id="ai-installation-guide">
 ## AIインストールガイド
 
 > このセクションはAIコーディングエージェント向けです。各ステップで検証コマンドを実行してから次に進んでください。
@@ -183,7 +183,7 @@ git --version
 ### ステップ1: クローンしてワンクリックセットアップ
 
 ```bash
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 bash install.sh
 ```
@@ -191,7 +191,7 @@ bash install.sh
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -254,8 +254,8 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 | プラットフォーム | コマンド |
 |------------------|----------|
-| **macOS / Linux** | `git clone https://github.com/GreenSheepStudio/claw-empire.git && cd claw-empire && bash install.sh` |
-| **Windows (PowerShell)** | `git clone https://github.com/GreenSheepStudio/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
+| **macOS / Linux** | `git clone https://github.com/GreenSheep01201/claw-empire.git && cd claw-empire && bash install.sh` |
+| **Windows (PowerShell)** | `git clone https://github.com/GreenSheep01201/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 
 既にクローン済みの場合:
 
@@ -271,7 +271,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 ```bash
 # 1. リポジトリをクローン
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. corepackでpnpmを有効化
@@ -306,7 +306,7 @@ pnpm dev:local
 
 ```powershell
 # 1. リポジトリをクローン
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. corepackでpnpmを有効化

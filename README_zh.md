@@ -52,6 +52,19 @@ Claw-Empire 将您的 CLI AI 编程助手 —— **Claude Code**、**Codex CLI**
 
 ---
 
+## 用 AI 安装
+
+> **只需将以下内容粘贴到您的 AI 编程代理（Claude Code、Codex、Gemini CLI 等）：**
+>
+> ```
+> Install Claw-Empire following the guide at:
+> https://github.com/GreenSheep01201/claw-empire
+> ```
+>
+> AI 将阅读此 README 并自动处理一切。
+
+---
+
 ## 截图
 
 <table>
@@ -149,20 +162,7 @@ Claw-Empire 将您的 CLI AI 编程助手 —— **Claude Code**、**Codex CLI**
 | **路由** | React Router 7 |
 | **导出** | PptxGenJS（PowerPoint 生成） |
 
----
-
-## 用 AI 安装
-
-> **只需将以下内容粘贴到您的 AI 编程代理（Claude Code、Codex、Gemini CLI 等）：**
->
-> ```
-> Install Claw-Empire following the guide at:
-> https://github.com/GreenSheepStudio/claw-empire
-> ```
->
-> AI 将阅读此 README 并自动处理一切。
-
-<a id="ai-installation-guide"></a>
+<a id="ai-installation-guide">
 ## AI 安装指南
 
 > 本节面向 AI 编程代理。请逐步执行，并在每一步运行验证命令后再继续。
@@ -183,7 +183,7 @@ git --version
 ### 第 1 步：克隆并执行一键安装
 
 ```bash
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 bash install.sh
 ```
@@ -191,7 +191,7 @@ bash install.sh
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -254,8 +254,8 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 | 平台 | 命令 |
 |------|------|
-| **macOS / Linux** | `git clone https://github.com/GreenSheepStudio/claw-empire.git && cd claw-empire && bash install.sh` |
-| **Windows (PowerShell)** | `git clone https://github.com/GreenSheepStudio/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
+| **macOS / Linux** | `git clone https://github.com/GreenSheep01201/claw-empire.git && cd claw-empire && bash install.sh` |
+| **Windows (PowerShell)** | `git clone https://github.com/GreenSheep01201/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 
 如果仓库已克隆：
 
@@ -271,7 +271,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. 通过 corepack 启用 pnpm
@@ -306,7 +306,7 @@ pnpm dev:local
 
 ```powershell
 # 1. 克隆仓库
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. 通过 corepack 启用 pnpm

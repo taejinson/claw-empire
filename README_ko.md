@@ -52,6 +52,19 @@ Claw-Empire는 CLI 기반 AI 코딩 어시스턴트 — **Claude Code**, **Codex
 
 ---
 
+## AI로 설치하기
+
+> **아래 내용을 AI 코딩 에이전트(Claude Code, Codex, Gemini CLI 등)에 붙여넣기만 하세요:**
+>
+> ```
+> Install Claw-Empire following the guide at:
+> https://github.com/GreenSheep01201/claw-empire
+> ```
+>
+> AI가 이 README를 읽고 모든 것을 자동으로 처리합니다.
+
+---
+
 ## 스크린샷
 
 <table>
@@ -149,20 +162,7 @@ Claw-Empire는 CLI 기반 AI 코딩 어시스턴트 — **Claude Code**, **Codex
 | **라우팅** | React Router 7 |
 | **내보내기** | PptxGenJS (PowerPoint 생성) |
 
----
-
-## AI로 설치하기
-
-> **아래 내용을 AI 코딩 에이전트(Claude Code, Codex, Gemini CLI 등)에 붙여넣기만 하세요:**
->
-> ```
-> Install Claw-Empire following the guide at:
-> https://github.com/GreenSheepStudio/claw-empire
-> ```
->
-> AI가 이 README를 읽고 모든 것을 자동으로 처리합니다.
-
-<a id="ai-installation-guide"></a>
+<a id="ai-installation-guide">
 ## AI 설치 가이드
 
 > 이 섹션은 AI 코딩 에이전트용입니다. 각 단계마다 검증 명령을 실행한 후 다음 단계로 진행하세요.
@@ -183,7 +183,7 @@ git --version
 ### 1단계: 클론 후 원클릭 셋업 실행
 
 ```bash
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 bash install.sh
 ```
@@ -191,7 +191,7 @@ bash install.sh
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -254,8 +254,8 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 | 플랫폼 | 명령어 |
 |--------|--------|
-| **macOS / Linux** | `git clone https://github.com/GreenSheepStudio/claw-empire.git && cd claw-empire && bash install.sh` |
-| **Windows (PowerShell)** | `git clone https://github.com/GreenSheepStudio/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
+| **macOS / Linux** | `git clone https://github.com/GreenSheep01201/claw-empire.git && cd claw-empire && bash install.sh` |
+| **Windows (PowerShell)** | `git clone https://github.com/GreenSheep01201/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 
 이미 클론되어 있다면:
 
@@ -271,7 +271,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 
 ```bash
 # 1. 저장소 클론
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. corepack으로 pnpm 활성화
@@ -306,7 +306,7 @@ pnpm dev:local
 
 ```powershell
 # 1. 저장소 클론
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. corepack으로 pnpm 활성화

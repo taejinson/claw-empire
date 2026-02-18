@@ -52,6 +52,19 @@ Claw-Empire transforms your CLI-based AI coding assistants — **Claude Code**, 
 
 ---
 
+## Install with AI
+
+> **Just paste this to your AI coding agent (Claude Code, Codex, Gemini CLI, etc.):**
+>
+> ```
+> Install Claw-Empire following the guide at:
+> https://github.com/GreenSheep01201/claw-empire
+> ```
+>
+> The AI will read this README and handle everything automatically.
+
+---
+
 ## Screenshots
 
 <table>
@@ -149,20 +162,7 @@ Claw-Empire transforms your CLI-based AI coding assistants — **Claude Code**, 
 | **Routing** | React Router 7 |
 | **Export** | PptxGenJS (PowerPoint generation) |
 
----
-
-## Install with AI
-
-> **Just paste this to your AI coding agent (Claude Code, Codex, Gemini CLI, etc.):**
->
-> ```
-> Install Claw-Empire following the guide at:
-> https://github.com/GreenSheepStudio/claw-empire
-> ```
->
-> The AI will read this README and handle everything automatically.
-
-<a id="ai-installation-guide"></a>
+<a id="ai-installation-guide">
 ## AI Installation Guide
 
 > This section is for AI coding agents. Execute each step and run verification commands before moving to the next step.
@@ -183,7 +183,7 @@ git --version
 ### Step 1: Clone and run one-click setup
 
 ```bash
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 bash install.sh
 ```
@@ -191,7 +191,7 @@ bash install.sh
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -254,8 +254,8 @@ If `OPENCLAW_CONFIG` is valid, this returns available messenger sessions.
 
 | Platform | Command |
 |----------|---------|
-| **macOS / Linux** | `git clone https://github.com/GreenSheepStudio/claw-empire.git && cd claw-empire && bash install.sh` |
-| **Windows (PowerShell)** | `git clone https://github.com/GreenSheepStudio/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
+| **macOS / Linux** | `git clone https://github.com/GreenSheep01201/claw-empire.git && cd claw-empire && bash install.sh` |
+| **Windows (PowerShell)** | `git clone https://github.com/GreenSheep01201/claw-empire.git; cd claw-empire; powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 
 If the repo is already cloned:
 
@@ -271,7 +271,7 @@ If the repo is already cloned:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. Enable pnpm via corepack
@@ -306,7 +306,7 @@ pnpm dev:local
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/GreenSheepStudio/claw-empire.git
+git clone https://github.com/GreenSheep01201/claw-empire.git
 cd claw-empire
 
 # 2. Enable pnpm via corepack
