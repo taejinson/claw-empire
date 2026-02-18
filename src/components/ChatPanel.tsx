@@ -132,14 +132,14 @@ export function ChatPanel({
     }
   }, [selectedAgent]);
 
-  const isDirectiveMode = input.trimStart().startsWith('!');
+  const isDirectiveMode = input.trimStart().startsWith('$');
 
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
 
-    // ! directive — priority over all modes
-    if (trimmed.startsWith('!')) {
+    // $ directive — priority over all modes
+    if (trimmed.startsWith('$')) {
       const directiveContent = trimmed.slice(1).trim();
       if (directiveContent) {
         onSendDirective(directiveContent);

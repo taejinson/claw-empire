@@ -96,16 +96,12 @@ function decryptSecret(payload: string): string {
 // ---------------------------------------------------------------------------
 const OAUTH_BASE_URL = process.env.OAUTH_BASE_URL || `http://${OAUTH_BASE_HOST}:${PORT}`;
 
-// Built-in OAuth client credentials (same as OpenClaw/Claw-Kanban built-in values)
-const BUILTIN_GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98";
-const BUILTIN_GOOGLE_CLIENT_ID = Buffer.from(
-  "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
-  "base64",
-).toString();
-const BUILTIN_GOOGLE_CLIENT_SECRET = Buffer.from(
-  "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=",
-  "base64",
-).toString();
+// OAuth client credentials – loaded exclusively from environment variables.
+// Set OAUTH_GITHUB_CLIENT_ID, OAUTH_GOOGLE_CLIENT_ID and
+// OAUTH_GOOGLE_CLIENT_SECRET in your .env file.
+const BUILTIN_GITHUB_CLIENT_ID = process.env.OAUTH_GITHUB_CLIENT_ID ?? "";
+const BUILTIN_GOOGLE_CLIENT_ID = process.env.OAUTH_GOOGLE_CLIENT_ID ?? "";
+const BUILTIN_GOOGLE_CLIENT_SECRET = process.env.OAUTH_GOOGLE_CLIENT_SECRET ?? "";
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -236,7 +232,7 @@ CREATE TABLE IF NOT EXISTS messages (
   receiver_type TEXT NOT NULL CHECK(receiver_type IN ('agent','department','all')),
   receiver_id TEXT,
   content TEXT NOT NULL,
-  message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','report','status_update')),
+  message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
   task_id TEXT REFERENCES tasks(id),
   created_at INTEGER DEFAULT (unixepoch()*1000)
 );
@@ -338,6 +334,55 @@ try { db.exec("ALTER TABLE subtasks ADD COLUMN delegated_task_id TEXT"); } catch
 
 // Cross-department collaboration: link collaboration task back to original task
 try { db.exec("ALTER TABLE tasks ADD COLUMN source_task_id TEXT"); } catch { /* already exists */ }
+
+// Migrate messages CHECK constraint to include 'directive'
+function migrateMessagesDirectiveType(): void {
+  const row = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'
+  `).get() as { sql?: string } | undefined;
+  const ddl = (row?.sql ?? "").toLowerCase();
+  if (ddl.includes("'directive'")) return;
+
+  console.log("[CLImpire] Migrating messages.message_type CHECK to include 'directive'");
+  const oldTable = "messages_directive_migration_old";
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    try {
+      db.exec(`ALTER TABLE messages RENAME TO ${oldTable}`);
+      db.exec(`
+        CREATE TABLE messages (
+          id TEXT PRIMARY KEY,
+          sender_type TEXT NOT NULL CHECK(sender_type IN ('ceo','agent','system')),
+          sender_id TEXT,
+          receiver_type TEXT NOT NULL CHECK(receiver_type IN ('agent','department','all')),
+          receiver_id TEXT,
+          content TEXT NOT NULL,
+          message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
+          task_id TEXT REFERENCES tasks(id),
+          created_at INTEGER DEFAULT (unixepoch()*1000)
+        );
+      `);
+      db.exec(`
+        INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at)
+        SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at
+        FROM ${oldTable};
+      `);
+      db.exec(`DROP TABLE ${oldTable}`);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      // Restore original table if migration failed
+      try { db.exec(`ALTER TABLE ${oldTable} RENAME TO messages`); } catch { /* */ }
+      throw e;
+    }
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+  // Recreate index
+  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_type, receiver_id, created_at DESC)");
+}
+migrateMessagesDirectiveType();
 
 function migrateLegacyTasksStatusSchema(): void {
   const row = db.prepare(`
@@ -442,7 +487,7 @@ function repairLegacyTaskForeignKeys(): void {
           receiver_type TEXT NOT NULL CHECK(receiver_type IN ('agent','department','all')),
           receiver_id TEXT,
           content TEXT NOT NULL,
-          message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','report','status_update')),
+          message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
           task_id TEXT REFERENCES tasks(id),
           created_at INTEGER DEFAULT (unixepoch()*1000)
         );
@@ -698,6 +743,17 @@ if (agentCount === 0) {
 const activeProcesses = new Map<string, ChildProcess>();
 const stopRequestedTasks = new Set<string>();
 const stopRequestModeByTask = new Map<string, "pause" | "cancel">();
+
+function readTimeoutMsEnv(name: string, fallbackMs: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallbackMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallbackMs;
+  return Math.floor(parsed);
+}
+
+const TASK_RUN_IDLE_TIMEOUT_MS = readTimeoutMsEnv("TASK_RUN_IDLE_TIMEOUT_MS", 8 * 60_000);
+const TASK_RUN_HARD_TIMEOUT_MS = readTimeoutMsEnv("TASK_RUN_HARD_TIMEOUT_MS", 45 * 60_000);
 
 // ---------------------------------------------------------------------------
 // Git Worktree support — agent isolation per task
@@ -1835,9 +1891,56 @@ function spawnCliAgent(
     windowsHide: true,
   });
 
+  let finished = false;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let hardTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearRunTimers = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+    if (hardTimer) {
+      clearTimeout(hardTimer);
+      hardTimer = null;
+    }
+  };
+  const triggerTimeout = (kind: "idle" | "hard") => {
+    if (finished) return;
+    finished = true;
+    clearRunTimers();
+    const timeoutMs = kind === "idle" ? TASK_RUN_IDLE_TIMEOUT_MS : TASK_RUN_HARD_TIMEOUT_MS;
+    const reason = kind === "idle"
+      ? `no output for ${Math.round(timeoutMs / 1000)}s`
+      : `exceeded max runtime ${Math.round(timeoutMs / 1000)}s`;
+    const msg = `[CLImpire] RUN TIMEOUT (${reason})`;
+    logStream.write(`\n${msg}\n`);
+    appendTaskLog(taskId, "error", msg);
+    try {
+      if (child.pid && child.pid > 0) {
+        killPidTree(child.pid);
+      } else {
+        child.kill("SIGTERM");
+      }
+    } catch {
+      // ignore kill race
+    }
+  };
+  const touchIdleTimer = () => {
+    if (finished || TASK_RUN_IDLE_TIMEOUT_MS <= 0) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => triggerTimeout("idle"), TASK_RUN_IDLE_TIMEOUT_MS);
+  };
+
+  touchIdleTimer();
+  if (TASK_RUN_HARD_TIMEOUT_MS > 0) {
+    hardTimer = setTimeout(() => triggerTimeout("hard"), TASK_RUN_HARD_TIMEOUT_MS);
+  }
+
   activeProcesses.set(taskId, child);
 
   child.on("error", (err) => {
+    finished = true;
+    clearRunTimers();
     console.error(`[CLImpire] spawn error for ${provider} (task ${taskId}): ${err.message}`);
     logStream.write(`\n[CLImpire] SPAWN ERROR: ${err.message}\n`);
     logStream.end();
@@ -1851,17 +1954,21 @@ function spawnCliAgent(
 
   // Pipe agent output to log file AND broadcast via WebSocket
   child.stdout?.on("data", (chunk: Buffer) => {
+    touchIdleTimer();
     logStream.write(chunk);
     const text = chunk.toString("utf8");
     broadcast("cli_output", { task_id: taskId, stream: "stdout", data: text });
     parseAndCreateSubtasks(taskId, text);
   });
   child.stderr?.on("data", (chunk: Buffer) => {
+    touchIdleTimer();
     logStream.write(chunk);
     broadcast("cli_output", { task_id: taskId, stream: "stderr", data: chunk.toString("utf8") });
   });
 
   child.on("close", () => {
+    finished = true;
+    clearRunTimers();
     logStream.end();
     try { fs.unlinkSync(promptPath); } catch { /* ignore */ }
   });
@@ -7270,6 +7377,91 @@ app.post("/api/directives", (req, res) => {
   }
 
   res.json({ ok: true, message: msg });
+});
+
+// ── Inbound webhook (Telegram / external) ───────────────────────────────────
+app.post("/api/inbox", (req, res) => {
+  const body = req.body ?? {};
+  const text = body.text;
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return res.status(400).json({ error: "text_required" });
+  }
+
+  const raw = text.trimStart();
+  const isDirective = raw.startsWith("$");
+  const content = isDirective ? raw.slice(1).trimStart() : raw;
+  if (!content) {
+    return res.status(400).json({ error: "empty_content" });
+  }
+
+  const id = randomUUID();
+  const t = nowMs();
+  const messageType = isDirective ? "directive" : "announcement";
+
+  // Store message
+  db.prepare(`
+    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, created_at)
+    VALUES (?, 'ceo', NULL, 'all', NULL, ?, ?, ?)
+  `).run(id, content, messageType, t);
+
+  const msg = {
+    id,
+    sender_type: "ceo",
+    sender_id: null,
+    receiver_type: "all",
+    receiver_id: null,
+    content,
+    message_type: messageType,
+    created_at: t,
+  };
+
+  // Broadcast
+  broadcast("announcement", msg);
+
+  // Team leaders respond
+  scheduleAnnouncementReplies(content);
+
+  if (isDirective) {
+    // Auto-delegate to planning team leader
+    const planningLeader = findTeamLeader("planning");
+    if (planningLeader) {
+      const delegationDelay = 3000 + Math.random() * 2000;
+      setTimeout(() => {
+        handleTaskDelegation(planningLeader, content, "");
+      }, delegationDelay);
+    }
+  }
+
+  // Handle @mentions
+  const mentions = detectMentions(content);
+  if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
+    const mentionDelay = 5000 + Math.random() * 2000;
+    setTimeout(() => {
+      const processedDepts = new Set<string>(isDirective ? ["planning"] : []);
+
+      for (const deptId of mentions.deptIds) {
+        if (processedDepts.has(deptId)) continue;
+        processedDepts.add(deptId);
+        const leader = findTeamLeader(deptId);
+        if (leader) {
+          handleTaskDelegation(leader, content, "");
+        }
+      }
+
+      for (const agentId of mentions.agentIds) {
+        const mentioned = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+        if (mentioned?.department_id && !processedDepts.has(mentioned.department_id)) {
+          processedDepts.add(mentioned.department_id);
+          const leader = findTeamLeader(mentioned.department_id);
+          if (leader) {
+            handleTaskDelegation(leader, content, "");
+          }
+        }
+      }
+    }, mentionDelay);
+  }
+
+  res.json({ ok: true, id, directive: isDirective });
 });
 
 // Delete conversation messages
