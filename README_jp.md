@@ -508,7 +508,9 @@ claw-empire/
 Claw-Empireはセキュリティを重視した設計になっています：
 
 - **ローカルファーストアーキテクチャ** — すべてのデータをSQLiteにローカル保存；外部クラウドサービス不要
-- **OAuthトークンの暗号化** — `OAUTH_ENCRYPTION_SECRET` によるAES暗号化
+- **OAuthトークンの暗号化** — ユーザーのOAuthトークンは**サーバー側のSQLiteにのみ保存**され、`OAUTH_ENCRYPTION_SECRET`を使用してAES-256-GCMで暗号化されます。ブラウザにリフレッシュトークンが渡ることはありません
+- **ビルトインOAuth Client ID** — ソースコードに埋め込まれたGitHub・Google OAuth client ID/secretは**公開OAuthアプリ認証情報**であり、ユーザーシークレットではありません。[Googleのドキュメント](https://developers.google.com/identity/protocols/oauth2/native-app)によると、インストール型/デスクトップアプリのclient secretは「シークレットとして扱われない」とされています。これはオープンソースアプリ（VS Code、Thunderbird、GitHub CLI等）の標準的な慣行です。これらの認証情報はアプリ自体を識別するだけであり、個人トークンは常に別途暗号化されます
+- **ソースコードに個人認証情報なし** — すべてのユーザー固有トークン（GitHub、Google OAuth）はローカルSQLiteに暗号化して保存され、ソースコードには含まれません
 - **リポジトリにシークレットを含まない** — 包括的な `.gitignore` が `.env`、`*.pem`、`*.key`、`credentials.json` などをブロック
 - **プリフライトセキュリティチェック** — 公開リリース前に `pnpm run preflight:public` を実行し、ワーキングツリーとgit履歴の両方で漏洩したシークレットをスキャン
 - **デフォルトでローカルホスト** — 開発サーバーは `127.0.0.1` にバインドされ、ネットワークに公開されない

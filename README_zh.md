@@ -508,7 +508,9 @@ claw-empire/
 Claw-Empire 在设计上充分考虑了安全性：
 
 - **本地优先架构** — 所有数据本地存储于 SQLite，无需外部云服务
-- **加密 OAuth 令牌** — 使用您的 `OAUTH_ENCRYPTION_SECRET` 进行 AES 加密
+- **加密 OAuth 令牌** — 用户 OAuth 令牌**仅存储在服务器端 SQLite** 中，使用 `OAUTH_ENCRYPTION_SECRET` 通过 AES-256-GCM 加密。浏览器永远不会接收刷新令牌
+- **内置 OAuth Client ID** — 源代码中嵌入的 GitHub 和 Google OAuth client ID/secret 是**公开的 OAuth 应用凭据**，而非用户密钥。根据 [Google 文档](https://developers.google.com/identity/protocols/oauth2/native-app)，安装型/桌面应用的 client secret "不被视为密钥"。这是开源应用（VS Code、Thunderbird、GitHub CLI 等）的标准做法。这些凭据仅用于标识应用本身，您的个人令牌始终单独加密
+- **源代码中无个人凭据** — 所有用户特定令牌（GitHub、Google OAuth）均加密存储在本地 SQLite 数据库中，不会出现在源代码中
 - **仓库中无密钥** — 全面的 `.gitignore` 配置屏蔽 `.env`、`*.pem`、`*.key`、`credentials.json` 等敏感文件
 - **发布前安全检查** — 在任何公开发布前运行 `pnpm run preflight:public`，扫描工作区和 git 历史中泄露的密钥
 - **默认绑定本地** — 开发服务器绑定到 `127.0.0.1`，不对外网暴露
