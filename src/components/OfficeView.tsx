@@ -373,7 +373,7 @@ function drawTiledFloor(
   }
 }
 
-function drawDesk(parent: Container, dx: number, dy: number, working: boolean) {
+function drawDesk(parent: Container, dx: number, dy: number, working: boolean): Graphics {
   const g = new Graphics();
   // Shadow
   g.ellipse(dx + DESK_W / 2, dy + DESK_H + 1, DESK_W / 2 + 1, 3).fill({ color: 0x000000, alpha: 0.15 });
@@ -409,6 +409,7 @@ function drawDesk(parent: Container, dx: number, dy: number, working: boolean) {
   g.rect(mx + 6, my - 2, 4, 2).fill(0x444455);
   g.rect(mx + 4, my - 3, 8, 1.5).fill(0x555566);
   parent.addChild(g);
+  return g;
 }
 
 function drawChair(parent: Container, cx: number, cy: number, color: number) {
@@ -605,7 +606,10 @@ export default function OfficeView({
   const animItemsRef = useRef<Array<{
     sprite: Container; status: string;
     baseX: number; baseY: number; particles: Container;
+    agentId?: string; cliProvider?: string;
+    deskG?: Graphics; bedG?: Graphics; blanketG?: Graphics;
   }>>([]);
+  const cliUsageRef = useRef<Record<string, CliUsageEntry> | null>(null);
   const roomRectsRef = useRef<RoomRect[]>([]);
   const deliveriesRef = useRef<Delivery[]>([]);
   const deliveryLayerRef = useRef<Container | null>(null);
@@ -1005,13 +1009,52 @@ export default function OfficeView({
           room.addChild(charContainer);
 
           // ── Desk AFTER character (covers legs) ──
-          drawDesk(room, ax - DESK_W / 2, deskY, isWorking);
+          const deskG = drawDesk(room, ax - DESK_W / 2, deskY, isWorking);
+
+          // ── Bed graphics (hidden, shown at 100% CLI usage) ──
+          // Split into bottom layer (frame+mattress+pillow) and top layer (blanket)
+          // so the blanket covers the character's legs
+          const bedW = TARGET_CHAR_H + 20; // wide enough for lying character
+          const bedH = 36;                 // bed depth (front-to-back)
+          const bedX = ax - bedW / 2;
+          const bedY = deskY;
+
+          // --- Bottom layer: frame + mattress + pillow ---
+          const bedG = new Graphics();
+          bedG.roundRect(bedX, bedY, bedW, bedH, 4).fill(0x5c3d2e);       // outer frame
+          bedG.roundRect(bedX + 1, bedY + 1, bedW - 2, bedH - 2, 3).fill(0x8b6347); // inner frame
+          bedG.roundRect(bedX + 3, bedY + 3, bedW - 6, bedH - 6, 2).fill(0xf0e6d3); // mattress
+          // Headboard (left edge, darker wood)
+          bedG.roundRect(bedX - 2, bedY - 1, 6, bedH + 2, 3).fill(0x4a2e1a);
+          // Pillow (left side, slightly indented)
+          bedG.ellipse(bedX + 16, bedY + bedH / 2, 9, 7).fill(0xfff8ee);
+          bedG.ellipse(bedX + 16, bedY + bedH / 2, 9, 7).stroke({ width: 0.5, color: 0xd8d0c0 });
+          // Pillow dent (where head rests)
+          bedG.ellipse(bedX + 16, bedY + bedH / 2, 5, 4).fill({ color: 0xf0e8d8, alpha: 0.6 });
+          bedG.visible = false;
+          room.addChild(bedG);
+
+          // --- Top layer: blanket (covers right ~60% of bed, over character's legs) ---
+          const blanketG = new Graphics();
+          const blankX = bedX + bedW * 0.35;
+          const blankW = bedW * 0.62;
+          blanketG.roundRect(blankX, bedY + 2, blankW, bedH - 4, 3).fill(0xc8d8be);
+          blanketG.roundRect(blankX, bedY + 2, blankW, bedH - 4, 3)
+            .stroke({ width: 0.5, color: 0xa8b898 });
+          // Blanket fold line
+          blanketG.moveTo(blankX + 2, bedY + bedH / 2)
+            .lineTo(blankX + blankW - 4, bedY + bedH / 2)
+            .stroke({ width: 0.4, color: 0xb0c0a0, alpha: 0.5 });
+          blanketG.visible = false;
+          room.addChild(blanketG);
 
           const particles = new Container();
           room.addChild(particles);
           animItemsRef.current.push({
             sprite: charContainer, status: agent.status,
             baseX: ax, baseY: charContainer.position.y, particles,
+            agentId: agent.id, cliProvider: agent.cli_provider,
+            deskG, bedG, blanketG,
           });
 
           // ── Active task speech bubble (above name tag) ──
@@ -1435,7 +1478,15 @@ export default function OfficeView({
         }
 
         // Agent animations
-        for (const { sprite, status, baseX, baseY, particles } of animItemsRef.current) {
+        for (const { sprite, status, baseX, baseY, particles, agentId, cliProvider, deskG, bedG, blanketG } of animItemsRef.current) {
+          // Hide desk sprite if agent is at CEO meeting table
+          if (agentId) {
+            const inMeeting = deliveriesRef.current.some(
+              d => d.agentId === agentId && d.holdAtSeat && d.arrived,
+            );
+            sprite.visible = !inMeeting;
+            if (inMeeting) continue;
+          }
           // Characters stay seated (no bobbing)
           sprite.position.x = baseX;
           sprite.position.y = baseY;
@@ -1452,12 +1503,154 @@ export default function OfficeView({
             }
             for (let i = particles.children.length - 1; i >= 0; i--) {
               const p = particles.children[i] as any;
+              if (p._sweat) continue; // skip sweat drops here
               p._life++;
               p.position.y += p._vy ?? -0.4;
               p.position.x += Math.sin(p._life * 0.2) * 0.2;
               p.alpha = Math.max(0, 1 - p._life * 0.03);
               p.scale.set(Math.max(0.1, 1 - p._life * 0.02));
               if (p._life > 35) { particles.removeChild(p); p.destroy(); }
+            }
+          }
+
+          // CLI usage stress visuals (3-tier)
+          if (cliProvider) {
+            const usage = cliUsageRef.current?.[cliProvider];
+            const maxUtil = usage?.windows?.reduce((m: number, w: { utilization: number }) => Math.max(m, w.utilization), 0) ?? 0;
+            const isOfflineAgent = status === "offline";
+
+            if (maxUtil >= 1.0) {
+              // === 100%: fainted — lie down on bed ===
+              // Position character lying on bed with head on pillow
+              // Bed layout: bedX = baseX - bedW/2, bedY = deskY = baseY-8
+              // With rotation -90° and anchor(0.5,1): head extends LEFT from position
+              // So position.x = headX + TARGET_CHAR_H to place head on pillow
+              const bedCX = baseX;
+              const bedCY = baseY - 8 + 18; // bedY + bedH/2 = deskY + 18
+              const headX = bedCX - TARGET_CHAR_H / 2 + 6; // head on pillow
+              sprite.rotation = -Math.PI / 2; // lie on back (head left)
+              // With anchor(0.5,1) rotated -90°: feet at position.x, head at position.x - TARGET_CHAR_H
+              sprite.position.set(headX + TARGET_CHAR_H - 6, bedCY);
+              sprite.alpha = 0.85;
+              const child0 = sprite.children[0];
+              if (child0 && 'tint' in child0) (child0 as any).tint = 0xff6666;
+              if (deskG) deskG.visible = false;
+              if (bedG) {
+                bedG.visible = true;
+                // Z-order: bedG(bottom) → sprite → blanketG(top)
+                const room = sprite.parent;
+                if (room) {
+                  room.removeChild(sprite);
+                  const bedIdx = room.children.indexOf(bedG);
+                  room.addChildAt(sprite, bedIdx + 1);
+                }
+              }
+              if (blanketG) {
+                blanketG.visible = true;
+                // Ensure blanket is above sprite
+                const room = sprite.parent;
+                if (room) {
+                  room.removeChild(blanketG);
+                  const sprIdx = room.children.indexOf(sprite);
+                  room.addChildAt(blanketG, sprIdx + 1);
+                }
+              }
+              // Dizzy star particle (orbit above head on pillow)
+              if (tick % 40 === 0) {
+                const star = new Graphics();
+                star.star(0, 0, 5, 3, 1.5, 0).fill({ color: 0xffdd44, alpha: 0.8 });
+                star.position.set(headX, bedCY - 22);
+                (star as any)._sweat = true;
+                (star as any)._dizzy = true;
+                (star as any)._offset = Math.random() * Math.PI * 2;
+                (star as any)._life = 0;
+                particles.addChild(star);
+              }
+              // zzZ text particle (float up from head)
+              if (tick % 80 === 0) {
+                const zz = new Text({
+                  text: "z",
+                  style: new TextStyle({ fontSize: 7 + Math.random() * 3, fill: 0xaaaacc, fontFamily: "monospace" }),
+                });
+                zz.anchor.set(0.5, 0.5);
+                zz.position.set(headX + 6, bedCY - 18);
+                (zz as any)._sweat = true;
+                (zz as any)._life = 0;
+                particles.addChild(zz);
+              }
+
+            } else if (maxUtil >= 0.8) {
+              // === 80%: red face + sweat ===
+              sprite.rotation = 0;
+              sprite.alpha = 1;
+              const child0 = sprite.children[0];
+              if (child0 && 'tint' in child0) (child0 as any).tint = 0xff9999;
+              if (deskG) deskG.visible = true;
+              if (bedG) bedG.visible = false;
+              if (blanketG) blanketG.visible = false;
+              // Sweat drops (more frequent)
+              if (tick % 40 === 0) {
+                const drop = new Graphics();
+                drop.moveTo(0, 0).lineTo(-1.8, 4).quadraticCurveTo(0, 6.5, 1.8, 4).lineTo(0, 0)
+                  .fill({ color: 0x7ec8e3, alpha: 0.85 });
+                drop.circle(0, 3.8, 1.2).fill({ color: 0xbde4f4, alpha: 0.5 });
+                drop.position.set(baseX + 8, baseY - 36);
+                (drop as any)._sweat = true;
+                (drop as any)._life = 0;
+                particles.addChild(drop);
+              }
+
+            } else if (maxUtil >= 0.6) {
+              // === 60%: sweat only ===
+              sprite.rotation = 0;
+              sprite.alpha = 1;
+              const child0 = sprite.children[0];
+              if (child0 && 'tint' in child0) (child0 as any).tint = 0xffffff;
+              if (deskG) deskG.visible = true;
+              if (bedG) bedG.visible = false;
+              if (blanketG) blanketG.visible = false;
+              if (tick % 55 === 0) {
+                const drop = new Graphics();
+                drop.moveTo(0, 0).lineTo(-1.8, 4).quadraticCurveTo(0, 6.5, 1.8, 4).lineTo(0, 0)
+                  .fill({ color: 0x7ec8e3, alpha: 0.85 });
+                drop.circle(0, 3.8, 1.2).fill({ color: 0xbde4f4, alpha: 0.5 });
+                drop.position.set(baseX + 8, baseY - 36);
+                (drop as any)._sweat = true;
+                (drop as any)._life = 0;
+                particles.addChild(drop);
+              }
+
+            } else {
+              // === Normal: reset all effects ===
+              sprite.rotation = 0;
+              sprite.alpha = isOfflineAgent ? 0.3 : 1;
+              const child0 = sprite.children[0];
+              if (child0 && 'tint' in child0) (child0 as any).tint = isOfflineAgent ? 0x888899 : 0xffffff;
+              if (deskG) deskG.visible = true;
+              if (bedG) bedG.visible = false;
+              if (blanketG) blanketG.visible = false;
+            }
+
+            // Animate existing sweat/dizzy particles
+            for (let i = particles.children.length - 1; i >= 0; i--) {
+              const p = particles.children[i] as any;
+              if (!p._sweat) continue;
+              p._life++;
+              if (p._dizzy) {
+                // Dizzy star: orbit around head on pillow
+                const headPX = baseX - TARGET_CHAR_H / 2 + 10;
+                const bedCY2 = baseY - 8 + 18;
+                const angle = tick * 0.08 + p._offset;
+                p.position.x = headPX + Math.cos(angle) * 14;
+                p.position.y = bedCY2 - 22 + Math.sin(angle * 0.7) * 4;
+                p.alpha = 0.7 + Math.sin(tick * 0.1) * 0.3;
+              } else {
+                // Sweat/zzZ: drip down
+                p.position.y += 0.45;
+                p.position.x += Math.sin(p._life * 0.15) * 0.15;
+                p.alpha = Math.max(0, 0.85 - p._life * 0.022);
+              }
+              if (p._life > 38) { particles.removeChild(p); p.destroy(); }
             }
           }
         }
@@ -1846,6 +2039,7 @@ export default function OfficeView({
   // ── CLI Usage Gauges ──
   const [cliStatus, setCliStatus] = useState<CliStatusMap | null>(null);
   const [cliUsage, setCliUsage] = useState<Record<string, CliUsageEntry> | null>(null);
+  cliUsageRef.current = cliUsage;
   const [refreshing, setRefreshing] = useState(false);
   const doneCountRef = useRef(0);
 
