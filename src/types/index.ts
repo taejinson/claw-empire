@@ -1,3 +1,7 @@
+import type { UiLanguage } from "../i18n";
+
+export type { UiLanguage };
+
 // Department
 export interface Department {
   id: string;
@@ -63,6 +67,32 @@ export interface TaskLog {
   kind: string;
   message: string;
   created_at: number;
+}
+
+export interface MeetingMinuteEntry {
+  id: number;
+  meeting_id: string;
+  seq: number;
+  speaker_agent_id: string | null;
+  speaker_name: string;
+  department_name: string | null;
+  role_label: string | null;
+  message_type: string;
+  content: string;
+  created_at: number;
+}
+
+export interface MeetingMinute {
+  id: string;
+  task_id: string;
+  meeting_type: 'planned' | 'review';
+  round: number;
+  title: string;
+  status: 'in_progress' | 'completed' | 'revision_requested' | 'failed';
+  started_at: number;
+  completed_at: number | null;
+  created_at: number;
+  entries: MeetingMinuteEntry[];
 }
 
 // Messages
@@ -193,7 +223,7 @@ export interface CompanySettings {
   ceoName: string;
   autoAssign: boolean;
   theme: 'dark' | 'light';
-  language: 'ko' | 'en';
+  language: UiLanguage;
   defaultProvider: CliProvider;
   providerModelConfig?: Record<string, ProviderModelConfig>;
 }
@@ -203,7 +233,7 @@ export const DEFAULT_SETTINGS: CompanySettings = {
   ceoName: 'CEO',
   autoAssign: true,
   theme: 'dark',
-  language: 'ko',
+  language: 'en',
   defaultProvider: 'claude',
   providerModelConfig: {},
 };

@@ -243,6 +243,31 @@ CREATE TABLE IF NOT EXISTS task_logs (
   created_at INTEGER DEFAULT (unixepoch()*1000)
 );
 
+CREATE TABLE IF NOT EXISTS meeting_minutes (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  meeting_type TEXT NOT NULL CHECK(meeting_type IN ('planned','review')),
+  round INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'in_progress' CHECK(status IN ('in_progress','completed','revision_requested','failed')),
+  started_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  created_at INTEGER DEFAULT (unixepoch()*1000)
+);
+
+CREATE TABLE IF NOT EXISTS meeting_minute_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  meeting_id TEXT NOT NULL REFERENCES meeting_minutes(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  speaker_agent_id TEXT REFERENCES agents(id),
+  speaker_name TEXT NOT NULL,
+  department_name TEXT,
+  role_label TEXT,
+  message_type TEXT NOT NULL DEFAULT 'chat',
+  content TEXT NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch()*1000)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -293,6 +318,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_dept ON tasks(department_id);
 CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_type, receiver_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_meeting_minutes_task ON meeting_minutes(task_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_meeting_minute_entries_meeting ON meeting_minute_entries(meeting_id, seq ASC);
 `);
 
 // Add columns to oauth_credentials for web-oauth tokens (safe to run repeatedly)
@@ -359,7 +386,16 @@ if (agentCount === 0) {
     insertSetting.run("companyName", "CLImpire Corp.");
     insertSetting.run("ceoName", "CEO");
     insertSetting.run("autoAssign", "true");
+    insertSetting.run("language", "en");
     console.log("[CLImpire] Seeded default settings");
+  }
+
+  const hasLanguageSetting = db
+    .prepare("SELECT 1 FROM settings WHERE key = 'language' LIMIT 1")
+    .get() as { 1: number } | undefined;
+  if (!hasLanguageSetting) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)")
+      .run("language", "en");
   }
 }
 
@@ -678,6 +714,359 @@ function getRecentConversationContext(agentId: string, limit = 10): string {
   return `\n\n--- Recent conversation context ---\n${lines.join("\n")}\n--- End context ---`;
 }
 
+interface MeetingTranscriptEntry {
+  speaker: string;
+  department: string;
+  role: string;
+  content: string;
+}
+
+interface OneShotRunOptions {
+  projectPath?: string;
+  timeoutMs?: number;
+  streamTaskId?: string | null;
+}
+
+interface OneShotRunResult {
+  text: string;
+  error?: string;
+}
+
+interface MeetingPromptOptions {
+  meetingType: "planned" | "review";
+  round: number;
+  taskTitle: string;
+  taskDescription: string | null;
+  transcript: MeetingTranscriptEntry[];
+  turnObjective: string;
+  stanceHint?: string;
+  lang: string;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomDelay(minMs: number, maxMs: number): number {
+  return Math.floor(minMs + Math.random() * Math.max(0, maxMs - minMs));
+}
+
+function getAgentDisplayName(agent: AgentRow, lang: string): string {
+  return lang === "ko" ? (agent.name_ko || agent.name) : agent.name;
+}
+
+function localeInstruction(lang: string): string {
+  switch (lang) {
+    case "ja":
+      return "Respond in Japanese.";
+    case "zh":
+      return "Respond in Chinese.";
+    case "en":
+      return "Respond in English.";
+    case "ko":
+    default:
+      return "Respond in Korean.";
+  }
+}
+
+function normalizeConversationReply(raw: string, maxChars = 420): string {
+  if (!raw.trim()) return "";
+  const parsed = prettyStreamJson(raw);
+  let text = parsed.trim() ? parsed : raw;
+  text = text
+    .replace(/^\[(init|usage|mcp|thread)\][^\n]*$/gim, "")
+    .replace(/^\[reasoning\]\s*/gim, "")
+    .replace(/\[(tool|result|output|spawn_agent|agent_done|one-shot-error)[^\]]*\]/gi, " ")
+    .replace(/^\[(copilot|antigravity)\][^\n]*$/gim, "")
+    .replace(/\b(Crafting|Formulating|Composing|Thinking|Analyzing)\b[^.!?。！？]{0,80}\b(message|reply)\s*/gi, "")
+    .replace(/\b(I need to|Let me|I'll|I will|First, I'?ll)\b[^.!?。！？]{0,140}\b(analy[sz]e|examin|inspect|check|review|look at)\b[^.!?。！？]*[.!?。！？]?/gi, " ")
+    .replace(/\b(current codebase|relevant files|quickly examine|let me quickly|analyze the current project)\b[^.!?。！？]*[.!?。！？]?/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/(?:^|\s)(find|ls|rg|grep|cat|head|tail|sed|awk|npm|pnpm|yarn|node|git|cd|pwd)\s+[^\n]+/gi, " ")
+    .replace(/---+/g, " ")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+
+  const sentenceParts = text
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const uniqueParts: string[] = [];
+  for (const part of sentenceParts) {
+    if (!uniqueParts.includes(part)) uniqueParts.push(part);
+    if (uniqueParts.length >= 2) break;
+  }
+  if (uniqueParts.length > 0) {
+    text = uniqueParts.join(" ");
+  }
+
+  if (text.length > maxChars) {
+    return `${text.slice(0, maxChars - 1).trimEnd()}…`;
+  }
+  return text;
+}
+
+function isInternalWorkNarration(text: string): boolean {
+  return /\b(I need to|Let me|I'll|I will|analy[sz]e|examin|inspect|check files|run command|current codebase|relevant files)\b/i.test(text);
+}
+
+type ReplyKind = "opening" | "feedback" | "summary" | "approval" | "direct";
+
+function fallbackTurnReply(kind: ReplyKind, lang: string, agent?: AgentRow): string {
+  const name = agent ? getAgentDisplayName(agent, lang) : "";
+  switch (kind) {
+    case "opening":
+      if (lang === "en") return `${name}: Kickoff noted. Please share concise feedback in order.`;
+      if (lang === "ja") return `${name}: キックオフを開始します。順番に簡潔なフィードバックを共有してください。`;
+      if (lang === "zh") return `${name}: 现在开始会议，请各位按顺序简要反馈。`;
+      return `${name}: 킥오프 회의를 시작합니다. 순서대로 핵심 피드백을 간단히 공유해주세요.`;
+    case "feedback":
+      if (lang === "en") return `${name}: We have identified key gaps and a top-priority validation item before execution.`;
+      if (lang === "ja") return `${name}: 着手前の補完項目と最優先の検証課題を確認しました。`;
+      if (lang === "zh") return `${name}: 已确认执行前的补充项与最高优先验证课题。`;
+      return `${name}: 착수 전 보완 항목과 최우선 검증 과제를 확인했습니다.`;
+    case "summary":
+      if (lang === "en") return `${name}: I will consolidate all leader feedback and proceed with the agreed next step.`;
+      if (lang === "ja") return `${name}: 各チームリーダーの意見を統合し、合意した次のステップへ進めます。`;
+      if (lang === "zh") return `${name}: 我将汇总各负责人意见，并按约定进入下一步。`;
+      return `${name}: 각 팀장 의견을 취합해 합의된 다음 단계로 진행하겠습니다.`;
+    case "approval":
+      if (lang === "en") return `${name}: Decision noted. We will proceed according to the current meeting conclusion.`;
+      if (lang === "ja") return `${name}: 本会議の結論に従って進行します。`;
+      if (lang === "zh") return `${name}: 已确认决策，将按本轮会议结论执行。`;
+      return `${name}: 본 회의 결론에 따라 진행하겠습니다.`;
+    case "direct":
+    default:
+      if (lang === "en") return `${name}: Acknowledged. Proceeding with the requested direction.`;
+      if (lang === "ja") return `${name}: 承知しました。ご指示の方向で進めます。`;
+      if (lang === "zh") return `${name}: 收到，将按您的指示推进。`;
+      return `${name}: 확인했습니다. 요청하신 방향으로 진행하겠습니다.`;
+  }
+}
+
+function chooseSafeReply(
+  run: OneShotRunResult,
+  lang: string,
+  kind: ReplyKind,
+  agent?: AgentRow,
+): string {
+  const cleaned = normalizeConversationReply(run.text || "", 360);
+  if (!cleaned) return fallbackTurnReply(kind, lang, agent);
+  if (/timeout after|CLI 응답 생성에 실패|response failed|one-shot-error/i.test(cleaned)) {
+    return fallbackTurnReply(kind, lang, agent);
+  }
+  if (isInternalWorkNarration(cleaned)) {
+    return fallbackTurnReply(kind, lang, agent);
+  }
+  if ((lang === "ko" || lang === "ja" || lang === "zh") && detectLang(cleaned) === "en" && cleaned.length > 20) {
+    return fallbackTurnReply(kind, lang, agent);
+  }
+  return cleaned;
+}
+
+function summarizeForMeetingBubble(text: string, maxChars = 96): string {
+  const cleaned = normalizeConversationReply(text, maxChars + 24)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "의견 공유드립니다.";
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
+function formatMeetingTranscript(transcript: MeetingTranscriptEntry[]): string {
+  if (transcript.length === 0) return "(none)";
+  return transcript
+    .map((line, idx) => `${idx + 1}. ${line.speaker} (${line.department} ${line.role}): ${line.content}`)
+    .join("\n");
+}
+
+function buildMeetingPrompt(agent: AgentRow, opts: MeetingPromptOptions): string {
+  const deptName = getDeptName(agent.department_id ?? "");
+  const role = getRoleLabel(agent.role, opts.lang as Lang);
+  const deptConstraint = agent.department_id ? getDeptRoleConstraint(agent.department_id, deptName) : "";
+  const recentCtx = getRecentConversationContext(agent.id, 8);
+  const meetingLabel = opts.meetingType === "planned" ? "Planned Approval" : "Review Consensus";
+  return [
+    `[CEO OFFICE ${meetingLabel}]`,
+    `Task: ${opts.taskTitle}`,
+    opts.taskDescription ? `Task context: ${opts.taskDescription}` : "",
+    `Round: ${opts.round}`,
+    `You are ${getAgentDisplayName(agent, opts.lang)} (${deptName} ${role}).`,
+    deptConstraint,
+    localeInstruction(opts.lang),
+    "Output rules:",
+    "- Return one natural chat message only (no JSON, no markdown).",
+    "- Keep it concise: 1-3 sentences.",
+    "- Make your stance explicit and actionable.",
+    opts.stanceHint ? `Required stance: ${opts.stanceHint}` : "",
+    `Current turn objective: ${opts.turnObjective}`,
+    "",
+    "[Meeting transcript so far]",
+    formatMeetingTranscript(opts.transcript),
+    recentCtx,
+  ].filter(Boolean).join("\n");
+}
+
+function buildDirectReplyPrompt(agent: AgentRow, ceoMessage: string, messageType: string): { prompt: string; lang: string } {
+  const lang = resolveLang(ceoMessage);
+  const deptName = getDeptName(agent.department_id ?? "");
+  const role = getRoleLabel(agent.role, lang);
+  const deptConstraint = agent.department_id ? getDeptRoleConstraint(agent.department_id, deptName) : "";
+  const recentCtx = getRecentConversationContext(agent.id, 12);
+  const typeHint = messageType === "report"
+    ? "CEO requested a report update."
+    : messageType === "task_assign"
+      ? "CEO assigned a task. Confirm understanding and concrete next step."
+      : "CEO sent a direct chat message.";
+  const prompt = [
+    "[CEO 1:1 Conversation]",
+    `You are ${getAgentDisplayName(agent, lang)} (${deptName} ${role}).`,
+    deptConstraint,
+    localeInstruction(lang),
+    "Output rules:",
+    "- Return one direct response message only (no JSON, no markdown).",
+    "- Keep it concise and practical (1-3 sentences).",
+    `Message type: ${messageType}`,
+    `Conversation intent: ${typeHint}`,
+    "",
+    `CEO message: ${ceoMessage}`,
+    recentCtx,
+  ].filter(Boolean).join("\n");
+  return { prompt, lang };
+}
+
+function buildCliFailureMessage(agent: AgentRow, lang: string, error?: string): string {
+  const name = getAgentDisplayName(agent, lang);
+  if (lang === "en") return `${name}: CLI response failed (${error || "unknown error"}).`;
+  if (lang === "ja") return `${name}: CLI応答の生成に失敗しました（${error || "不明なエラー"}）。`;
+  if (lang === "zh") return `${name}: CLI回复生成失败（${error || "未知错误"}）。`;
+  return `${name}: CLI 응답 생성에 실패했습니다 (${error || "알 수 없는 오류"}).`;
+}
+
+async function runAgentOneShot(
+  agent: AgentRow,
+  prompt: string,
+  opts: OneShotRunOptions = {},
+): Promise<OneShotRunResult> {
+  const provider = agent.cli_provider || "claude";
+  const timeoutMs = opts.timeoutMs ?? 180_000;
+  const projectPath = opts.projectPath || process.cwd();
+  const streamTaskId = opts.streamTaskId ?? null;
+  const runId = `meeting-${agent.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const logPath = path.join(logsDir, `${runId}.log`);
+  const logStream = fs.createWriteStream(logPath, { flags: "w" });
+  let rawOutput = "";
+  let exitCode = 0;
+
+  const onChunk = (chunk: Buffer | string, stream: "stdout" | "stderr") => {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    rawOutput += text;
+    logStream.write(text);
+    if (streamTaskId) {
+      broadcast("cli_output", { task_id: streamTaskId, stream, data: text });
+    }
+  };
+
+  try {
+    if (provider === "copilot" || provider === "antigravity") {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        if (provider === "copilot") {
+          await executeCopilotAgent(prompt, projectPath, logStream, controller.signal, streamTaskId ?? undefined);
+        } else {
+          await executeAntigravityAgent(prompt, logStream, controller.signal, streamTaskId ?? undefined);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (!rawOutput.trim() && fs.existsSync(logPath)) {
+        rawOutput = fs.readFileSync(logPath, "utf8");
+      }
+    } else {
+      const modelConfig = getProviderModelConfig();
+      const model = modelConfig[provider]?.model || undefined;
+      const reasoningLevel = modelConfig[provider]?.reasoningLevel || undefined;
+      const args = buildAgentArgs(provider, model, reasoningLevel);
+
+      await new Promise<void>((resolve, reject) => {
+        const cleanEnv = { ...process.env };
+        delete cleanEnv.CLAUDECODE;
+        delete cleanEnv.CLAUDE_CODE;
+
+        const child = spawn(args[0], args.slice(1), {
+          cwd: projectPath,
+          env: cleanEnv,
+          shell: process.platform === "win32",
+          stdio: ["pipe", "pipe", "pipe"],
+          detached: false,
+          windowsHide: true,
+        });
+
+        const timeout = setTimeout(() => {
+          const pid = child.pid ?? 0;
+          if (pid > 0) killPidTree(pid);
+          reject(new Error(`timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        child.on("error", (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+        child.stdout?.on("data", (chunk: Buffer) => onChunk(chunk, "stdout"));
+        child.stderr?.on("data", (chunk: Buffer) => onChunk(chunk, "stderr"));
+        child.on("close", (code) => {
+          clearTimeout(timeout);
+          exitCode = code ?? 1;
+          resolve();
+        });
+
+        child.stdin?.write(prompt);
+        child.stdin?.end();
+      });
+    }
+  } catch (err: any) {
+    const message = err?.message ? String(err.message) : String(err);
+    onChunk(`\n[one-shot-error] ${message}\n`, "stderr");
+    const partial = normalizeConversationReply(rawOutput, 320);
+    if (partial) return { text: partial, error: message };
+    const rough = (prettyStreamJson(rawOutput).trim() ? prettyStreamJson(rawOutput) : rawOutput)
+      .replace(/\s+/g, " ")
+      .trim();
+    if (rough) {
+      const clipped = rough.length > 320 ? `${rough.slice(0, 319).trimEnd()}…` : rough;
+      return { text: clipped, error: message };
+    }
+    return { text: "", error: message };
+  } finally {
+    await new Promise<void>((resolve) => logStream.end(resolve));
+  }
+
+  if (exitCode !== 0 && !rawOutput.trim()) {
+    return { text: "", error: `${provider} exited with code ${exitCode}` };
+  }
+
+  const normalized = normalizeConversationReply(rawOutput);
+  if (normalized) return { text: normalized };
+
+  const rough = (prettyStreamJson(rawOutput).trim() ? prettyStreamJson(rawOutput) : rawOutput)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (rough) {
+    const clipped = rough.length > 320 ? `${rough.slice(0, 319).trimEnd()}…` : rough;
+    return { text: clipped };
+  }
+
+  const lang = getPreferredLanguage();
+  if (lang === "en") return { text: "Acknowledged. Continuing to the next step." };
+  if (lang === "ja") return { text: "確認しました。次のステップへ進みます。" };
+  if (lang === "zh") return { text: "已确认，继续进入下一步。" };
+  return { text: "확인했습니다. 다음 단계로 진행하겠습니다." };
+}
+
 // ---------------------------------------------------------------------------
 // Subtask department detection — re-uses DEPT_KEYWORDS + detectTargetDepartments
 // ---------------------------------------------------------------------------
@@ -709,9 +1098,16 @@ function createSubtaskFromCli(taskId: string, toolUseId: string, title: string):
 
   if (targetDeptId) {
     const targetDeptName = getDeptName(targetDeptId);
+    const lang = getPreferredLanguage();
+    const blockedReason = pickL(l(
+      [`${targetDeptName} 협업 대기`],
+      [`Waiting for ${targetDeptName} collaboration`],
+      [`${targetDeptName}の協業待ち`],
+      [`等待${targetDeptName}协作`],
+    ), lang);
     db.prepare(
       "UPDATE subtasks SET target_department_id = ?, status = 'blocked', blocked_reason = ? WHERE id = ?"
-    ).run(targetDeptId, `${targetDeptName} 협업 대기`, subId);
+    ).run(targetDeptId, blockedReason, subId);
   }
 
   const subtask = db.prepare("SELECT * FROM subtasks WHERE id = ?").get(subId);
@@ -751,6 +1147,7 @@ function seedApprovedPlanSubtasks(taskId: string, ownerDeptId: string | null): v
   const baseDeptId = ownerDeptId ?? task.department_id;
   const relatedDepts = getTaskRelatedDepartmentIds(taskId, baseDeptId)
     .filter((d) => !!d && d !== baseDeptId);
+  const lang = resolveLang(task.description ?? task.title);
 
   const now = nowMs();
   const baseAssignee = task.assigned_agent_id;
@@ -764,8 +1161,18 @@ function seedApprovedPlanSubtasks(taskId: string, ownerDeptId: string | null): v
     targetDepartmentId: string | null;
   }> = [
     {
-      title: "승인안 상세 실행 계획 확정",
-      description: `Approved 기획안 기준으로 상세 작업 순서/산출물 기준을 확정합니다. (${task.title})`,
+      title: pickL(l(
+        ["승인안 상세 실행 계획 확정"],
+        ["Finalize detailed execution plan from approved proposal"],
+        ["承認案の詳細実行計画を確定"],
+        ["确定批准方案的详细执行计划"],
+      ), lang),
+      description: pickL(l(
+        [`Approved 기획안 기준으로 상세 작업 순서/산출물 기준을 확정합니다. (${task.title})`],
+        [`Finalize detailed task sequence and deliverable criteria based on the approved plan. (${task.title})`],
+        [`承認済み企画案を基準に、詳細な作業順序と成果物基準を確定します。(${task.title})`],
+        [`基于已批准方案，确定详细任务顺序与交付物标准。（${task.title}）`],
+      ), lang),
       status: "pending",
       assignedAgentId: baseAssignee,
       blockedReason: null,
@@ -777,18 +1184,43 @@ function seedApprovedPlanSubtasks(taskId: string, ownerDeptId: string | null): v
     const deptName = getDeptName(deptId);
     const crossLeader = findTeamLeader(deptId);
     items.push({
-      title: `[협업] ${deptName} 결과물 작성`,
-      description: `Approved 기획안 기준 ${deptName} 담당 결과물을 작성/공유합니다.`,
+      title: pickL(l(
+        [`[협업] ${deptName} 결과물 작성`],
+        [`[Collaboration] Produce ${deptName} deliverable`],
+        [`[協業] ${deptName}成果物を作成`],
+        [`[协作] 编写${deptName}交付物`],
+      ), lang),
+      description: pickL(l(
+        [`Approved 기획안 기준 ${deptName} 담당 결과물을 작성/공유합니다.`],
+        [`Create and share the ${deptName}-owned deliverable based on the approved plan.`],
+        [`承認済み企画案を基準に、${deptName}担当の成果物を作成・共有します。`],
+        [`基于已批准方案，完成并共享${deptName}负责的交付物。`],
+      ), lang),
       status: "blocked",
       assignedAgentId: crossLeader?.id ?? null,
-      blockedReason: `${deptName} 협업 대기`,
+      blockedReason: pickL(l(
+        [`${deptName} 협업 대기`],
+        [`Waiting for ${deptName} collaboration`],
+        [`${deptName}の協業待ち`],
+        [`等待${deptName}协作`],
+      ), lang),
       targetDepartmentId: deptId,
     });
   }
 
   items.push({
-    title: "부서 산출물 통합 및 최종 정리",
-    description: "유관부서 산출물을 취합해 단일 결과물로 통합하고 Review 제출본을 준비합니다.",
+    title: pickL(l(
+      ["부서 산출물 통합 및 최종 정리"],
+      ["Consolidate department deliverables and finalize package"],
+      ["部門成果物の統合と最終整理"],
+      ["整合部门交付物并完成最终整理"],
+    ), lang),
+    description: pickL(l(
+      ["유관부서 산출물을 취합해 단일 결과물로 통합하고 Review 제출본을 준비합니다."],
+      ["Collect related-department outputs, merge into one package, and prepare the review submission."],
+      ["関連部門の成果物を集約して単一成果物へ統合し、レビュー提出版を準備します。"],
+      ["汇总相关部门产出，整合为单一成果，并准备 Review 提交版本。"],
+    ), lang),
     status: "pending",
     assignedAgentId: baseAssignee,
     blockedReason: null,
@@ -815,7 +1247,12 @@ function seedApprovedPlanSubtasks(taskId: string, ownerDeptId: string | null): v
   }
 
   appendTaskLog(taskId, "system", `Approved plan seeded ${items.length} subtasks (cross-dept: ${relatedDepts.length})`);
-  notifyCeo(`'${task.title}' 승인안 기준 SubTask ${items.length}건을 생성하고 담당자/유관부서 협업을 배정했습니다.`, taskId);
+  notifyCeo(pickL(l(
+    [`'${task.title}' 승인안 기준 SubTask ${items.length}건을 생성하고 담당자/유관부서 협업을 배정했습니다.`],
+    [`Created ${items.length} subtasks from the approved plan for '${task.title}' and assigned owners/cross-department collaboration.`],
+    [`'${task.title}' の承認案に基づき SubTask を${items.length}件作成し、担当者と関連部門協業を割り当てました。`],
+    [`已基于'${task.title}'的批准方案创建${items.length}个 SubTask，并分配负责人及跨部门协作。`],
+  ), lang), taskId);
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,6 +2499,82 @@ function getTaskReviewLeaders(
   return leaders;
 }
 
+interface MeetingMinutesRow {
+  id: string;
+  task_id: string;
+  meeting_type: "planned" | "review";
+  round: number;
+  title: string;
+  status: "in_progress" | "completed" | "revision_requested" | "failed";
+  started_at: number;
+  completed_at: number | null;
+  created_at: number;
+}
+
+interface MeetingMinuteEntryRow {
+  id: number;
+  meeting_id: string;
+  seq: number;
+  speaker_agent_id: string | null;
+  speaker_name: string;
+  department_name: string | null;
+  role_label: string | null;
+  message_type: string;
+  content: string;
+  created_at: number;
+}
+
+function beginMeetingMinutes(
+  taskId: string,
+  meetingType: "planned" | "review",
+  round: number,
+  title: string,
+): string {
+  const meetingId = randomUUID();
+  const t = nowMs();
+  db.prepare(`
+    INSERT INTO meeting_minutes (id, task_id, meeting_type, round, title, status, started_at, created_at)
+    VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
+  `).run(meetingId, taskId, meetingType, round, title, t, t);
+  return meetingId;
+}
+
+function appendMeetingMinuteEntry(
+  meetingId: string,
+  seq: number,
+  agent: AgentRow,
+  lang: string,
+  messageType: string,
+  content: string,
+): void {
+  const deptName = getDeptName(agent.department_id ?? "");
+  const roleLabel = getRoleLabel(agent.role, lang as Lang);
+  db.prepare(`
+    INSERT INTO meeting_minute_entries
+      (meeting_id, seq, speaker_agent_id, speaker_name, department_name, role_label, message_type, content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    meetingId,
+    seq,
+    agent.id,
+    getAgentDisplayName(agent, lang),
+    deptName || null,
+    roleLabel || null,
+    messageType,
+    content,
+    nowMs(),
+  );
+}
+
+function finishMeetingMinutes(
+  meetingId: string,
+  status: "completed" | "revision_requested" | "failed",
+): void {
+  db.prepare(
+    "UPDATE meeting_minutes SET status = ?, completed_at = ? WHERE id = ?"
+  ).run(status, nowMs(), meetingId);
+}
+
 function markAgentInMeeting(agentId: string, holdMs = 90_000): void {
   meetingPresenceUntil.set(agentId, nowMs() + holdMs);
   const row = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
@@ -2090,7 +2603,26 @@ function callLeadersToCeoOffice(taskId: string, leaders: AgentRow[], phase: "kic
       seat_index: seatIndex,
       phase,
       task_id: taskId,
+      action: "arrive",
     });
+  });
+}
+
+function emitMeetingSpeech(
+  agentId: string,
+  seatIndex: number,
+  phase: "kickoff" | "review",
+  taskId: string,
+  line: string,
+): void {
+  const preview = summarizeForMeetingBubble(line);
+  broadcast("ceo_office_call", {
+    from_agent_id: agentId,
+    seat_index: seatIndex,
+    phase,
+    task_id: taskId,
+    action: "speak",
+    line: preview,
   });
 }
 
@@ -2103,108 +2635,223 @@ function startReviewConsensusMeeting(
   if (reviewInFlight.has(taskId)) return;
   reviewInFlight.add(taskId);
 
-  const leaders = getTaskReviewLeaders(taskId, departmentId);
-  if (leaders.length === 0) {
-    reviewInFlight.delete(taskId);
-    onApproved();
-    return;
-  }
+  void (async () => {
+    let meetingId: string | null = null;
+    try {
+      const leaders = getTaskReviewLeaders(taskId, departmentId);
+      if (leaders.length === 0) {
+        reviewInFlight.delete(taskId);
+        onApproved();
+        return;
+      }
 
-  const round = (reviewRoundState.get(taskId) ?? 0) + 1;
-  reviewRoundState.set(taskId, round);
+      const round = (reviewRoundState.get(taskId) ?? 0) + 1;
+      reviewRoundState.set(taskId, round);
 
-  const planningLeader = leaders.find((l) => l.department_id === "planning") ?? leaders[0];
-  const otherLeaders = leaders.filter((l) => l.id !== planningLeader.id);
-  const needsRevision = leaders.length > 1 && round === 1;
-  const reviseOwner = needsRevision ? (otherLeaders[0] ?? planningLeader) : null;
+      const planningLeader = leaders.find((l) => l.department_id === "planning") ?? leaders[0];
+      const otherLeaders = leaders.filter((l) => l.id !== planningLeader.id);
+      let needsRevision = false;
+      let reviseOwner: AgentRow | null = null;
+      const seatIndexByAgent = new Map(leaders.slice(0, 6).map((leader, idx) => [leader.id, idx]));
 
-  callLeadersToCeoOffice(taskId, leaders, "review");
-  notifyCeo(`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round} 시작. 팀장 의견 수집 및 상호 승인 진행합니다.`, taskId);
+      const taskCtx = db.prepare(
+        "SELECT description, project_path FROM tasks WHERE id = ?"
+      ).get(taskId) as { description: string | null; project_path: string | null } | undefined;
+      const taskDescription = taskCtx?.description ?? null;
+      const projectPath = resolveProjectPath({
+        title: taskTitle,
+        description: taskDescription,
+        project_path: taskCtx?.project_path ?? null,
+      });
+      const lang = resolveLang(taskDescription ?? taskTitle);
+      const transcript: MeetingTranscriptEntry[] = [];
+      const oneShotOptions = { projectPath, timeoutMs: 35_000 };
+      const wantsRevision = (content: string): boolean => (
+        /보완|수정|보류|리스크|추가.?필요|hold|revise|revision|required|pending|risk|block|保留|修正|补充|暂缓/i
+      ).test(content);
+      meetingId = beginMeetingMinutes(taskId, "review", round, taskTitle);
+      let minuteSeq = 1;
 
-  sendAgentMessage(
-    planningLeader,
-    `CEO OFFICE 회의 시작합니다. '${taskTitle}' 관련 이슈/아이디어를 순서대로 공유해주세요. 의견 취합 후 최종안으로 승인 요청드리겠습니다.`,
-    "chat",
-    "all",
-    null,
-    taskId,
-  );
+      const pushTranscript = (leader: AgentRow, content: string) => {
+        transcript.push({
+          speaker: getAgentDisplayName(leader, lang),
+          department: getDeptName(leader.department_id ?? ""),
+          role: getRoleLabel(leader.role, lang as Lang),
+          content,
+        });
+      };
+      const speak = (leader: AgentRow, messageType: string, receiverType: string, receiverId: string | null, content: string) => {
+        sendAgentMessage(leader, content, messageType, receiverType, receiverId, taskId);
+        const seatIndex = seatIndexByAgent.get(leader.id) ?? 0;
+        emitMeetingSpeech(leader.id, seatIndex, "review", taskId, content);
+        pushTranscript(leader, content);
+        if (meetingId) {
+          appendMeetingMinuteEntry(meetingId, minuteSeq++, leader, lang, messageType, content);
+        }
+      };
 
-  let delay = 900;
-  for (const leader of otherLeaders) {
-    const leaderName = leader.name_ko || leader.name;
-    const deptName = getDeptName(leader.department_id ?? "");
-    const feedback = reviseOwner?.id === leader.id
-      ? `${deptName} ${leaderName}: 현재 결과물에서 보완이 필요한 이슈 1건 확인했습니다. 수정안 반영 후 승인하겠습니다.`
-      : `${deptName} ${leaderName}: 검토 의견 공유드립니다. 리스크는 낮고, 현재안 기반으로 진행 가능해 보입니다.`;
-    setTimeout(() => {
-      sendAgentMessage(leader, feedback, "chat", "agent", planningLeader.id, taskId);
-    }, delay);
-    delay += 850;
-  }
+      callLeadersToCeoOffice(taskId, leaders, "review");
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round} 시작. 팀장 의견 수집 및 상호 승인 진행합니다.`],
+        [`[CEO OFFICE] '${taskTitle}' review round ${round} started. Collecting team-lead feedback and mutual approvals.`],
+        [`[CEO OFFICE] '${taskTitle}' レビューラウンド${round}を開始しました。チームリーダー意見収集と相互承認を進めます。`],
+        [`[CEO OFFICE] 已开始'${taskTitle}'第${round}轮 Review，正在收集团队负责人意见并进行相互审批。`],
+      ), lang), taskId);
 
-  if (otherLeaders.length === 0) {
-    setTimeout(() => {
-      sendAgentMessage(
-        planningLeader,
-        "단독 검토 결과 공유드립니다. 주요 산출물/의존성/리스크 모두 점검 완료했습니다.",
-        "chat",
-        "all",
-        null,
-        taskId,
-      );
-    }, delay);
-    delay += 700;
-  }
+      const openingPrompt = buildMeetingPrompt(planningLeader, {
+        meetingType: "review",
+        round,
+        taskTitle,
+        taskDescription,
+        transcript,
+        turnObjective: "Kick off the CEO office review discussion and ask each leader for concrete feedback.",
+        stanceHint: "Facilitate discussion and commit to synthesizing the final review direction.",
+        lang,
+      });
+      const openingRun = await runAgentOneShot(planningLeader, openingPrompt, oneShotOptions);
+      const openingText = chooseSafeReply(openingRun, lang, "opening", planningLeader);
+      speak(planningLeader, "chat", "all", null, openingText);
+      await sleepMs(randomDelay(720, 1300));
 
-  setTimeout(() => {
-    const summary = needsRevision
-      ? `기획팀 취합 의견: 공통 과제는 유지하되, 지적된 보완 항목을 반영한 수정안으로 재검토하겠습니다.`
-      : `기획팀 취합 의견: 각 부서 의견을 반영한 최종안 확정 가능 상태입니다. 전원 최종 동의(Approved) 부탁드립니다.`;
-    sendAgentMessage(planningLeader, summary, "report", "all", null, taskId);
-  }, delay);
-  delay += 900;
+      for (const leader of otherLeaders) {
+        const feedbackPrompt = buildMeetingPrompt(leader, {
+          meetingType: "review",
+          round,
+          taskTitle,
+          taskDescription,
+          transcript,
+          turnObjective: "Provide concise review feedback and indicate whether risk is acceptable.",
+          stanceHint: "If revision is needed, explicitly state what must be fixed before approval.",
+          lang,
+        });
+        const feedbackRun = await runAgentOneShot(leader, feedbackPrompt, oneShotOptions);
+        const feedbackText = chooseSafeReply(feedbackRun, lang, "feedback", leader);
+        speak(leader, "chat", "agent", planningLeader.id, feedbackText);
+        if (wantsRevision(feedbackText)) {
+          needsRevision = true;
+          if (!reviseOwner) reviseOwner = leader;
+        }
+        await sleepMs(randomDelay(650, 1180));
+      }
 
-  leaders.forEach((leader, idx) => {
-    const approved = !needsRevision;
-    const leaderName = leader.name_ko || leader.name;
-    const approvalMsg = approved
-      ? `${leaderName}: 최종안 확인 완료, Approved 합니다.`
-      : (reviseOwner?.id === leader.id
-        ? `${leaderName}: 현재안은 Approved 보류합니다. 보완안 반영 후 승인하겠습니다.`
-        : `${leaderName}: 보완안 반영 조건으로 동의합니다. 최종 Approved는 다음 라운드에서 진행하겠습니다.`);
-    setTimeout(() => {
-      sendAgentMessage(leader, approvalMsg, "status_update", "all", null, taskId);
-    }, delay + idx * 500);
-  });
-  delay += leaders.length * 500 + 600;
+      if (otherLeaders.length === 0) {
+        const soloPrompt = buildMeetingPrompt(planningLeader, {
+          meetingType: "review",
+          round,
+          taskTitle,
+          taskDescription,
+          transcript,
+          turnObjective: "As the only reviewer, provide your single-party review conclusion.",
+          stanceHint: "Summarize risks, dependencies, and confidence level in one concise message.",
+          lang,
+        });
+        const soloRun = await runAgentOneShot(planningLeader, soloPrompt, oneShotOptions);
+        const soloText = chooseSafeReply(soloRun, lang, "feedback", planningLeader);
+        speak(planningLeader, "chat", "all", null, soloText);
+        await sleepMs(randomDelay(620, 980));
+      }
 
-  setTimeout(() => {
-    if (needsRevision) {
-      appendTaskLog(taskId, "system", `Review consensus round ${round}: revision requested`);
-      notifyCeo(`[CEO OFFICE] '${taskTitle}' 승인 보류. 기획팀이 보완안 반영 후 재승인 라운드를 시작합니다.`, taskId);
+      const summaryPrompt = buildMeetingPrompt(planningLeader, {
+        meetingType: "review",
+        round,
+        taskTitle,
+        taskDescription,
+        transcript,
+        turnObjective: needsRevision
+          ? "Synthesize feedback and announce revision plan before the next approval round."
+          : "Synthesize feedback and request final all-leader approval.",
+        stanceHint: needsRevision
+          ? "State that revision items will be reflected and a follow-up approval round will run."
+          : "State that the final review package is ready for immediate approval.",
+        lang,
+      });
+      const summaryRun = await runAgentOneShot(planningLeader, summaryPrompt, oneShotOptions);
+      const summaryText = chooseSafeReply(summaryRun, lang, "summary", planningLeader);
+      speak(planningLeader, "report", "all", null, summaryText);
+      await sleepMs(randomDelay(680, 1120));
 
-      const now = nowMs();
-      db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, taskId);
-      broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+      for (const leader of leaders) {
+        const isReviseOwner = reviseOwner?.id === leader.id;
+        const approvalPrompt = buildMeetingPrompt(leader, {
+          meetingType: "review",
+          round,
+          taskTitle,
+          taskDescription,
+          transcript,
+          turnObjective: "State your final approval decision for this review round.",
+          stanceHint: !needsRevision
+            ? "Approve the current review package if ready; otherwise hold approval with concrete revision items."
+            : (isReviseOwner
+              ? "Hold approval until your requested revision is reflected."
+              : "Agree with conditional approval pending revision reflection."),
+          lang,
+        });
+        const approvalRun = await runAgentOneShot(leader, approvalPrompt, oneShotOptions);
+        const approvalText = chooseSafeReply(approvalRun, lang, "approval", leader);
+        speak(leader, "status_update", "all", null, approvalText);
+        if (wantsRevision(approvalText)) {
+          needsRevision = true;
+          if (!reviseOwner) reviseOwner = leader;
+        }
+        await sleepMs(randomDelay(420, 860));
+      }
 
-      setTimeout(() => {
+      await sleepMs(randomDelay(540, 920));
+
+      if (needsRevision) {
+        appendTaskLog(taskId, "system", `Review consensus round ${round}: revision requested`);
+        notifyCeo(pickL(l(
+          [`[CEO OFFICE] '${taskTitle}' 승인 보류. 기획팀이 보완안 반영 후 재승인 라운드를 시작합니다.`],
+          [`[CEO OFFICE] '${taskTitle}' approval is on hold. Planning will reflect revisions and start a re-approval round.`],
+          [`[CEO OFFICE] '${taskTitle}' は承認保留です。企画チームが修正反映後、再承認ラウンドを開始します。`],
+          [`[CEO OFFICE] '${taskTitle}'审批暂缓。企划团队将完成修订后发起再次审批。`],
+        ), lang), taskId);
+
+        const now = nowMs();
+        db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, taskId);
+        broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+
+        await sleepMs(2600);
         const t2 = nowMs();
         db.prepare("UPDATE tasks SET status = 'review', updated_at = ? WHERE id = ?").run(t2, taskId);
         appendTaskLog(taskId, "system", `Review consensus round ${round}: revision reflected, back to review`);
         broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
-        notifyCeo(`[CEO OFFICE] '${taskTitle}' 보완안 반영 완료. 재검토 및 재승인 라운드를 시작합니다.`, taskId);
+        notifyCeo(pickL(l(
+          [`[CEO OFFICE] '${taskTitle}' 보완안 반영 완료. 재검토 및 재승인 라운드를 시작합니다.`],
+          [`[CEO OFFICE] Revision updates for '${taskTitle}' are complete. Starting re-review and re-approval round.`],
+          [`[CEO OFFICE] '${taskTitle}' の修正反映が完了しました。再レビュー・再承認ラウンドを開始します。`],
+          [`[CEO OFFICE] '${taskTitle}'修订已完成，开始重新评审与再次审批。`],
+        ), lang), taskId);
+        if (meetingId) finishMeetingMinutes(meetingId, "revision_requested");
         reviewInFlight.delete(taskId);
         finishReview(taskId, taskTitle);
-      }, 2600);
-      return;
-    }
+        return;
+      }
 
-    appendTaskLog(taskId, "system", `Review consensus round ${round}: all leaders approved`);
-    notifyCeo(`[CEO OFFICE] '${taskTitle}' 전원 Approved 완료. Done 단계로 진행합니다.`, taskId);
-    reviewInFlight.delete(taskId);
-    onApproved();
-  }, delay);
+      appendTaskLog(taskId, "system", `Review consensus round ${round}: all leaders approved`);
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' 전원 Approved 완료. Done 단계로 진행합니다.`],
+        [`[CEO OFFICE] '${taskTitle}' is approved by all leaders. Proceeding to Done.`],
+        [`[CEO OFFICE] '${taskTitle}' は全リーダー承認済みです。Doneへ進みます。`],
+        [`[CEO OFFICE] '${taskTitle}'已获全体负责人批准，进入 Done 阶段。`],
+      ), lang), taskId);
+      if (meetingId) finishMeetingMinutes(meetingId, "completed");
+      reviewInFlight.delete(taskId);
+      onApproved();
+    } catch (err: any) {
+      const msg = err?.message ? String(err.message) : String(err);
+      appendTaskLog(taskId, "error", `Review consensus meeting error: ${msg}`);
+      const errLang = resolveLang(taskTitle);
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 처리 중 오류가 발생했습니다: ${msg}`],
+        [`[CEO OFFICE] Error while processing review round for '${taskTitle}': ${msg}`],
+        [`[CEO OFFICE] '${taskTitle}' のレビューラウンド処理中にエラーが発生しました: ${msg}`],
+        [`[CEO OFFICE] 处理'${taskTitle}'评审轮次时发生错误：${msg}`],
+      ), errLang), taskId);
+      if (meetingId) finishMeetingMinutes(meetingId, "failed");
+      reviewInFlight.delete(taskId);
+    }
+  })();
 }
 
 function startTaskExecutionForAgent(
@@ -2259,7 +2906,13 @@ function startTaskExecutionForAgent(
     handleTaskRunComplete(taskId, code ?? 1);
   });
 
-  notifyCeo(`${execName}가 '${taskData.title}' 작업을 시작했습니다.`, taskId);
+  const lang = resolveLang(taskData.description ?? taskData.title);
+  notifyCeo(pickL(l(
+    [`${execName}가 '${taskData.title}' 작업을 시작했습니다.`],
+    [`${execName} started work on '${taskData.title}'.`],
+    [`${execName}が '${taskData.title}' の作業を開始しました。`],
+    [`${execName} 已开始处理 '${taskData.title}'。`],
+  ), lang), taskId);
   startProgressTimer(taskId, taskData.title, deptId);
 }
 
@@ -2269,86 +2922,195 @@ function startPlannedApprovalMeeting(
   departmentId: string | null,
   onApproved: () => void,
 ): void {
-  if (reviewInFlight.has(`planned:${taskId}`)) return;
-  reviewInFlight.add(`planned:${taskId}`);
+  const lockKey = `planned:${taskId}`;
+  if (reviewInFlight.has(lockKey)) return;
+  reviewInFlight.add(lockKey);
 
-  const leaders = getTaskReviewLeaders(taskId, departmentId);
-  if (leaders.length === 0) {
-    reviewInFlight.delete(`planned:${taskId}`);
-    onApproved();
-    return;
-  }
+  void (async () => {
+    let meetingId: string | null = null;
+    try {
+      const leaders = getTaskReviewLeaders(taskId, departmentId);
+      if (leaders.length === 0) {
+        reviewInFlight.delete(lockKey);
+        onApproved();
+        return;
+      }
 
-  const round = (reviewRoundState.get(`planned:${taskId}`) ?? 0) + 1;
-  reviewRoundState.set(`planned:${taskId}`, round);
+      const round = (reviewRoundState.get(lockKey) ?? 0) + 1;
+      reviewRoundState.set(lockKey, round);
 
-  const planningLeader = leaders.find((l) => l.department_id === "planning") ?? leaders[0];
-  const otherLeaders = leaders.filter((l) => l.id !== planningLeader.id);
-  const needsRevision = leaders.length > 1 && round === 1;
-  const reviseOwner = needsRevision ? (otherLeaders[0] ?? planningLeader) : null;
+      const planningLeader = leaders.find((l) => l.department_id === "planning") ?? leaders[0];
+      const otherLeaders = leaders.filter((l) => l.id !== planningLeader.id);
+      let needsRevision = false;
+      let reviseOwner: AgentRow | null = null;
+      const seatIndexByAgent = new Map(leaders.slice(0, 6).map((leader, idx) => [leader.id, idx]));
 
-  callLeadersToCeoOffice(taskId, leaders, "kickoff");
-  notifyCeo(`[CEO OFFICE] '${taskTitle}' Planned 승인 라운드 ${round} 시작. 부서별 의견 수집 후 전원 Approved 확인합니다.`, taskId);
+      const taskCtx = db.prepare(
+        "SELECT description, project_path FROM tasks WHERE id = ?"
+      ).get(taskId) as { description: string | null; project_path: string | null } | undefined;
+      const taskDescription = taskCtx?.description ?? null;
+      const projectPath = resolveProjectPath({
+        title: taskTitle,
+        description: taskDescription,
+        project_path: taskCtx?.project_path ?? null,
+      });
+      const lang = resolveLang(taskDescription ?? taskTitle);
+      const transcript: MeetingTranscriptEntry[] = [];
+      const oneShotOptions = { projectPath, timeoutMs: 35_000 };
+      const wantsRevision = (content: string): boolean => (
+        /보완|수정|보류|리스크|추가.?필요|hold|revise|revision|required|pending|risk|block|保留|修正|补充|暂缓/i
+      ).test(content);
+      meetingId = beginMeetingMinutes(taskId, "planned", round, taskTitle);
+      let minuteSeq = 1;
 
-  sendAgentMessage(
-    planningLeader,
-    `기획팀장입니다. '${taskTitle}' 착수 전 의견을 순서대로 공유해주세요. 제가 취합 후 최종안으로 승인 요청하겠습니다.`,
-    "chat",
-    "all",
-    null,
-    taskId,
-  );
+      const pushTranscript = (leader: AgentRow, content: string) => {
+        transcript.push({
+          speaker: getAgentDisplayName(leader, lang),
+          department: getDeptName(leader.department_id ?? ""),
+          role: getRoleLabel(leader.role, lang as Lang),
+          content,
+        });
+      };
+      const speak = (leader: AgentRow, messageType: string, receiverType: string, receiverId: string | null, content: string) => {
+        sendAgentMessage(leader, content, messageType, receiverType, receiverId, taskId);
+        const seatIndex = seatIndexByAgent.get(leader.id) ?? 0;
+        emitMeetingSpeech(leader.id, seatIndex, "kickoff", taskId, content);
+        pushTranscript(leader, content);
+        if (meetingId) {
+          appendMeetingMinuteEntry(meetingId, minuteSeq++, leader, lang, messageType, content);
+        }
+      };
 
-  let delay = 900;
-  for (const leader of otherLeaders) {
-    const deptName = getDeptName(leader.department_id ?? "");
-    const leaderName = leader.name_ko || leader.name;
-    const feedback = reviseOwner?.id === leader.id
-      ? `${deptName} ${leaderName}: 착수 전 보완 필요사항 1건 있습니다. 해당 항목 보완 후 Approved 가능합니다.`
-      : `${deptName} ${leaderName}: 의견 공유드립니다. 현재 계획으로 착수 가능하며 의존성 리스크 낮습니다.`;
-    setTimeout(() => {
-      sendAgentMessage(leader, feedback, "chat", "agent", planningLeader.id, taskId);
-    }, delay);
-    delay += 820;
-  }
+      callLeadersToCeoOffice(taskId, leaders, "kickoff");
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' Planned 승인 라운드 ${round} 시작. 부서별 의견 수집 후 전원 Approved 확인합니다.`],
+        [`[CEO OFFICE] '${taskTitle}' planned approval round ${round} started. Collecting department feedback and confirming all approvals.`],
+        [`[CEO OFFICE] '${taskTitle}' のPlanned承認ラウンド${round}を開始。部門別意見を集め、全員承認を確認します。`],
+        [`[CEO OFFICE] 已开始'${taskTitle}'第${round}轮 Planned 审批，正在收集各部门意见并确认全员批准。`],
+      ), lang), taskId);
 
-  setTimeout(() => {
-    const summary = needsRevision
-      ? `기획팀장 취합 의견: 제기된 보완사항 반영 후 같은 테이블에서 재승인 받겠습니다.`
-      : `기획팀장 취합 의견: 부서 의견 반영한 최종 착수안 확정입니다. 전원 Approved 부탁드립니다.`;
-    sendAgentMessage(planningLeader, summary, "report", "all", null, taskId);
-  }, delay);
-  delay += 900;
+      const openingPrompt = buildMeetingPrompt(planningLeader, {
+        meetingType: "planned",
+        round,
+        taskTitle,
+        taskDescription,
+        transcript,
+        turnObjective: "Open the kickoff approval meeting and request concise pre-start feedback from each team leader.",
+        stanceHint: "You are facilitating and will synthesize all inputs into one launch plan.",
+        lang,
+      });
+      const openingRun = await runAgentOneShot(planningLeader, openingPrompt, oneShotOptions);
+      const openingText = chooseSafeReply(openingRun, lang, "opening", planningLeader);
+      speak(planningLeader, "chat", "all", null, openingText);
+      await sleepMs(randomDelay(700, 1260));
 
-  leaders.forEach((leader, idx) => {
-    const approved = !needsRevision;
-    const leaderName = leader.name_ko || leader.name;
-    const approval = approved
-      ? `${leaderName}: Planned 단계 최종안 Approved 합니다.`
-      : (reviseOwner?.id === leader.id
-        ? `${leaderName}: 보완안 확인 전까지 Approved 보류합니다.`
-        : `${leaderName}: 보완 반영 조건으로 동의합니다.`);
-    setTimeout(() => {
-      sendAgentMessage(leader, approval, "status_update", "all", null, taskId);
-    }, delay + idx * 480);
-  });
-  delay += leaders.length * 480 + 600;
+      for (const leader of otherLeaders) {
+        const feedbackPrompt = buildMeetingPrompt(leader, {
+          meetingType: "planned",
+          round,
+          taskTitle,
+          taskDescription,
+          transcript,
+          turnObjective: "Share concise kickoff readiness feedback and dependency risk level.",
+          stanceHint: "If revision is needed, explicitly state what must be fixed before approval.",
+          lang,
+        });
+        const feedbackRun = await runAgentOneShot(leader, feedbackPrompt, oneShotOptions);
+        const feedbackText = chooseSafeReply(feedbackRun, lang, "feedback", leader);
+        speak(leader, "chat", "agent", planningLeader.id, feedbackText);
+        if (wantsRevision(feedbackText)) {
+          needsRevision = true;
+          if (!reviseOwner) reviseOwner = leader;
+        }
+        await sleepMs(randomDelay(620, 1080));
+      }
 
-  setTimeout(() => {
-    if (needsRevision) {
-      appendTaskLog(taskId, "system", `Planned approval round ${round}: revision requested`);
-      notifyCeo(`[CEO OFFICE] '${taskTitle}' Planned 승인 보류. 보완안 반영 후 재승인 라운드를 진행합니다.`, taskId);
-      reviewInFlight.delete(`planned:${taskId}`);
-      setTimeout(() => startPlannedApprovalMeeting(taskId, taskTitle, departmentId, onApproved), 2200);
-      return;
+      const summaryPrompt = buildMeetingPrompt(planningLeader, {
+        meetingType: "planned",
+        round,
+        taskTitle,
+        taskDescription,
+        transcript,
+        turnObjective: needsRevision
+          ? "Summarize revision items and announce a follow-up approval round."
+          : "Summarize aligned kickoff plan and ask for final approval.",
+        stanceHint: needsRevision
+          ? "Clearly state supplement reflection first, then re-approval."
+          : "Clearly state final kickoff plan is ready now.",
+        lang,
+      });
+      const summaryRun = await runAgentOneShot(planningLeader, summaryPrompt, oneShotOptions);
+      const summaryText = chooseSafeReply(summaryRun, lang, "summary", planningLeader);
+      speak(planningLeader, "report", "all", null, summaryText);
+      await sleepMs(randomDelay(640, 1120));
+
+      for (const leader of leaders) {
+        const isReviseOwner = reviseOwner?.id === leader.id;
+        const approvalPrompt = buildMeetingPrompt(leader, {
+          meetingType: "planned",
+          round,
+          taskTitle,
+          taskDescription,
+          transcript,
+          turnObjective: "State your final kickoff approval decision for this round.",
+          stanceHint: !needsRevision
+            ? "Approve kickoff plan now if ready; otherwise hold approval with concrete revision items."
+            : (isReviseOwner
+              ? "Hold approval until supplement reflection is verified."
+              : "Agree with conditional approval pending supplement reflection."),
+          lang,
+        });
+        const approvalRun = await runAgentOneShot(leader, approvalPrompt, oneShotOptions);
+        const approvalText = chooseSafeReply(approvalRun, lang, "approval", leader);
+        speak(leader, "status_update", "all", null, approvalText);
+        if (wantsRevision(approvalText)) {
+          needsRevision = true;
+          if (!reviseOwner) reviseOwner = leader;
+        }
+        await sleepMs(randomDelay(420, 840));
+      }
+
+      await sleepMs(randomDelay(520, 900));
+
+      if (needsRevision) {
+        appendTaskLog(taskId, "system", `Planned approval round ${round}: revision requested`);
+        notifyCeo(pickL(l(
+          [`[CEO OFFICE] '${taskTitle}' Planned 승인 보류. 보완안 반영 후 재승인 라운드를 진행합니다.`],
+          [`[CEO OFFICE] '${taskTitle}' planned approval is on hold. Revisions will be applied and a re-approval round will follow.`],
+          [`[CEO OFFICE] '${taskTitle}' のPlanned承認は保留です。修正反映後に再承認ラウンドを行います。`],
+          [`[CEO OFFICE] '${taskTitle}'的 Planned 审批已暂缓，修订后将进入再次审批。`],
+        ), lang), taskId);
+        if (meetingId) finishMeetingMinutes(meetingId, "revision_requested");
+        reviewInFlight.delete(lockKey);
+        setTimeout(() => startPlannedApprovalMeeting(taskId, taskTitle, departmentId, onApproved), 2200);
+        return;
+      }
+
+      appendTaskLog(taskId, "system", `Planned approval round ${round}: all leaders approved`);
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' Planned 단계 전원 Approved 완료. In Progress로 전환합니다.`],
+        [`[CEO OFFICE] '${taskTitle}' is approved by all leaders at Planned stage. Moving to In Progress.`],
+        [`[CEO OFFICE] '${taskTitle}' はPlanned段階で全員承認済みです。In Progressへ移行します。`],
+        [`[CEO OFFICE] '${taskTitle}'在 Planned 阶段已获全员批准，转为 In Progress。`],
+      ), lang), taskId);
+      if (meetingId) finishMeetingMinutes(meetingId, "completed");
+      reviewRoundState.delete(lockKey);
+      reviewInFlight.delete(lockKey);
+      onApproved();
+    } catch (err: any) {
+      const msg = err?.message ? String(err.message) : String(err);
+      appendTaskLog(taskId, "error", `Planned approval meeting error: ${msg}`);
+      const errLang = resolveLang(taskTitle);
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] '${taskTitle}' Planned 승인 회의 처리 중 오류가 발생했습니다: ${msg}`],
+        [`[CEO OFFICE] Error while processing planned approval meeting for '${taskTitle}': ${msg}`],
+        [`[CEO OFFICE] '${taskTitle}' のPlanned承認会議処理中にエラーが発生しました: ${msg}`],
+        [`[CEO OFFICE] 处理'${taskTitle}'的 Planned 审批会议时发生错误：${msg}`],
+      ), errLang), taskId);
+      if (meetingId) finishMeetingMinutes(meetingId, "failed");
+      reviewInFlight.delete(lockKey);
     }
-
-    appendTaskLog(taskId, "system", `Planned approval round ${round}: all leaders approved`);
-    notifyCeo(`[CEO OFFICE] '${taskTitle}' Planned 단계 전원 Approved 완료. In Progress로 전환합니다.`, taskId);
-    reviewRoundState.delete(`planned:${taskId}`);
-    reviewInFlight.delete(`planned:${taskId}`);
-    onApproved();
-  }, delay);
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -2363,6 +3125,7 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
     assigned_agent_id: string | null;
     department_id: string | null;
     title: string;
+    description: string | null;
     status: string;
   } | undefined;
   const stopRequested = stopRequestedTasks.has(taskId);
@@ -2462,9 +3225,17 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
 
     // Notify: task entering review
     if (task) {
+      const lang = resolveLang(task.description ?? task.title);
       const leader = findTeamLeader(task.department_id);
-      const leaderName = leader?.name_ko || leader?.name || "팀장";
-      notifyCeo(`${leaderName}이(가) '${task.title}' 결과를 검토 중입니다.`, taskId);
+      const leaderName = leader
+        ? getAgentDisplayName(leader, lang)
+        : pickL(l(["팀장"], ["Team Lead"], ["チームリーダー"], ["组长"]), lang);
+      notifyCeo(pickL(l(
+        [`${leaderName}이(가) '${task.title}' 결과를 검토 중입니다.`],
+        [`${leaderName} is reviewing the result for '${task.title}'.`],
+        [`${leaderName}が '${task.title}' の成果をレビュー中です。`],
+        [`${leaderName} 正在审核 '${task.title}' 的结果。`],
+      ), lang), taskId);
     }
 
     // Schedule team leader review message (2-3s delay)
@@ -2589,6 +3360,7 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
 
 // Move a reviewed task to 'done'
 function finishReview(taskId: string, taskTitle: string): void {
+  const lang = resolveLang(taskTitle);
   const currentTask = db.prepare("SELECT status, department_id FROM tasks WHERE id = ?").get(taskId) as { status: string; department_id: string | null } | undefined;
   if (!currentTask || currentTask.status !== "review") return; // Already moved or cancelled
 
@@ -2596,7 +3368,12 @@ function finishReview(taskId: string, taskTitle: string): void {
     "SELECT COUNT(*) as cnt FROM subtasks WHERE task_id = ? AND status != 'done'"
   ).get(taskId) as { cnt: number };
   if (remainingSubtasks.cnt > 0) {
-    notifyCeo(`'${taskTitle}' 는 아직 ${remainingSubtasks.cnt}개 서브태스크가 남아 있어 Review 단계에서 대기합니다.`, taskId);
+    notifyCeo(pickL(l(
+      [`'${taskTitle}' 는 아직 ${remainingSubtasks.cnt}개 서브태스크가 남아 있어 Review 단계에서 대기합니다.`],
+      [`'${taskTitle}' is waiting in Review because ${remainingSubtasks.cnt} subtasks are still unfinished.`],
+      [`'${taskTitle}' は未完了サブタスクが${remainingSubtasks.cnt}件あるため、Reviewで待機しています。`],
+      [`'${taskTitle}' 仍有 ${remainingSubtasks.cnt} 个 SubTask 未完成，当前在 Review 阶段等待。`],
+    ), lang), taskId);
     appendTaskLog(taskId, "system", `Review hold: waiting for ${remainingSubtasks.cnt} unfinished subtasks`);
     return;
   }
@@ -2647,8 +3424,15 @@ function finishReview(taskId: string, taskTitle: string): void {
     refreshCliUsageData().then((usage) => broadcast("cli_usage_update", usage)).catch(() => {});
 
     const leader = findTeamLeader(latestTask.department_id);
-    const leaderName = leader?.name_ko || leader?.name || "팀장";
-    notifyCeo(`${leaderName}: '${taskTitle}' 최종 승인 완료 보고드립니다.${mergeNote}`, taskId);
+    const leaderName = leader
+      ? getAgentDisplayName(leader, lang)
+      : pickL(l(["팀장"], ["Team Lead"], ["チームリーダー"], ["组长"]), lang);
+    notifyCeo(pickL(l(
+      [`${leaderName}: '${taskTitle}' 최종 승인 완료 보고드립니다.${mergeNote}`],
+      [`${leaderName}: Final approval completed for '${taskTitle}'.${mergeNote}`],
+      [`${leaderName}: '${taskTitle}' の最終承認が完了しました。${mergeNote}`],
+      [`${leaderName}：'${taskTitle}' 最终审批已完成。${mergeNote}`],
+    ), lang), taskId);
 
     reviewRoundState.delete(taskId);
     reviewInFlight.delete(taskId);
@@ -2948,6 +3732,25 @@ app.get("/api/tasks/:id", (req, res) => {
   ).all(id);
 
   res.json({ task, logs, subtasks });
+});
+
+app.get("/api/tasks/:id/meeting-minutes", (req, res) => {
+  const id = String(req.params.id);
+  const exists = db.prepare("SELECT id FROM tasks WHERE id = ?").get(id) as { id: string } | undefined;
+  if (!exists) return res.status(404).json({ error: "not_found" });
+
+  const meetings = db.prepare(
+    "SELECT * FROM meeting_minutes WHERE task_id = ? ORDER BY started_at DESC, round DESC"
+  ).all(id) as MeetingMinutesRow[];
+
+  const data = meetings.map((meeting) => {
+    const entries = db.prepare(
+      "SELECT * FROM meeting_minute_entries WHERE meeting_id = ? ORDER BY seq ASC, id ASC"
+    ).all(meeting.id) as MeetingMinuteEntryRow[];
+    return { ...meeting, entries };
+  });
+
+  res.json({ meetings: data });
 });
 
 app.patch("/api/tasks/:id", (req, res) => {
@@ -3546,6 +4349,36 @@ function sendAgentMessage(
 
 type Lang = "ko" | "en" | "ja" | "zh";
 
+const SUPPORTED_LANGS: readonly Lang[] = ["ko", "en", "ja", "zh"] as const;
+
+function isLang(value: unknown): value is Lang {
+  return typeof value === "string" && SUPPORTED_LANGS.includes(value as Lang);
+}
+
+function readSettingString(key: string): string | undefined {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
+  if (!row) return undefined;
+  try {
+    const parsed = JSON.parse(row.value);
+    return typeof parsed === "string" ? parsed : row.value;
+  } catch {
+    return row.value;
+  }
+}
+
+function getPreferredLanguage(): Lang {
+  const settingLang = readSettingString("language");
+  return isLang(settingLang) ? settingLang : "en";
+}
+
+function resolveLang(text?: string, fallback?: Lang): Lang {
+  const settingLang = readSettingString("language");
+  if (isLang(settingLang)) return settingLang;
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (trimmed) return detectLang(trimmed);
+  return fallback ?? getPreferredLanguage();
+}
+
 function detectLang(text: string): Lang {
   const ko = text.match(/[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/g)?.length ?? 0;
   const ja = text.match(/[\u3040-\u309F\u30A0-\u30FF]/g)?.length ?? 0;
@@ -3735,7 +4568,7 @@ function classifyIntent(msg: string, lang: Lang) {
 
 function generateChatReply(agent: AgentRow, ceoMessage: string): string {
   const msg = ceoMessage.trim();
-  const lang = detectLang(msg);
+  const lang = resolveLang(msg);
   const name = lang === "ko" ? (agent.name_ko || agent.name) : agent.name;
   const dept = agent.department_id ? getDeptName(agent.department_id) : "";
   const role = getRoleLabel(agent.role, lang);
@@ -3955,7 +4788,7 @@ function generateAnnouncementReply(agent: AgentRow, announcement: string, lang: 
 }
 
 function scheduleAnnouncementReplies(announcement: string): void {
-  const lang = detectLang(announcement);
+  const lang = resolveLang(announcement);
   const teamLeaders = db.prepare(
     "SELECT * FROM agents WHERE role = 'team_leader' AND status != 'offline'"
   ).all() as AgentRow[];
@@ -4021,7 +4854,7 @@ function handleMentionDelegation(
   originLeader: AgentRow,
   targetDeptId: string,
   ceoMessage: string,
-  lang: string,
+  lang: Lang,
 ): void {
   const crossLeader = findTeamLeader(targetDeptId);
   if (!crossLeader) return;
@@ -4115,6 +4948,7 @@ function buildSubtaskDelegationPrompt(
   targetDeptId: string,
   targetDeptName: string,
 ): string {
+  const lang = resolveLang(parentTask.description ?? parentTask.title);
   // Gather all sibling subtasks for context
   const allSubtasks = db.prepare(
     "SELECT id, title, status, target_department_id FROM subtasks WHERE task_id = ? ORDER BY created_at"
@@ -4129,34 +4963,65 @@ function buildSubtaskDelegationPrompt(
     const deptLabel = st.target_department_id ? getDeptName(st.target_department_id) : getDeptName(parentTask.description ? "" : "");
     const parentDept = db.prepare("SELECT department_id FROM tasks WHERE id = ?").get(parentTask.id) as { department_id: string | null } | undefined;
     const dept = st.target_department_id ? getDeptName(st.target_department_id) : getDeptName(parentDept?.department_id ?? "");
-    const marker = st.id === subtask.id ? " ← 당신의 담당" : "";
+    const marker = st.id === subtask.id
+      ? pickL(l(
+        [" ← 당신의 담당"],
+        [" <- assigned to you"],
+        [" ← あなたの担当"],
+        [" <- 你的负责项"],
+      ), lang)
+      : "";
     return `${icon} ${st.title} (${dept} - ${st.status})${marker}`;
   }).join("\n");
 
   const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[execAgent.role] || execAgent.role;
   const deptConstraint = getDeptRoleConstraint(targetDeptId, targetDeptName);
   const conversationCtx = getRecentConversationContext(execAgent.id);
+  const agentDisplayName = getAgentDisplayName(execAgent, lang);
+  const header = pickL(l(
+    [`[프로젝트 협업 업무 - ${targetDeptName}]`],
+    [`[Project collaboration task - ${targetDeptName}]`],
+    [`[プロジェクト協業タスク - ${targetDeptName}]`],
+    [`[项目协作任务 - ${targetDeptName}]`],
+  ), lang);
+  const originalTaskLabel = pickL(l(["원본 업무"], ["Original task"], ["元タスク"], ["原始任务"]), lang);
+  const ceoRequestLabel = pickL(l(["CEO 요청"], ["CEO request"], ["CEO依頼"], ["CEO指示"]), lang);
+  const allSubtasksLabel = pickL(l(["전체 서브태스크 현황"], ["All subtask status"], ["全サブタスク状況"], ["全部 SubTask 状态"]), lang);
+  const deptOwnedLabel = pickL(l(
+    [`[${targetDeptName} 담당 업무]`],
+    [`[${targetDeptName} owned task]`],
+    [`[${targetDeptName}担当タスク]`],
+    [`[${targetDeptName}负责任务]`],
+  ), lang);
+  const titleLabel = pickL(l(["제목"], ["Title"], ["タイトル"], ["标题"]), lang);
+  const descriptionLabel = pickL(l(["설명"], ["Description"], ["説明"], ["说明"]), lang);
+  const finalInstruction = pickL(l(
+    ["위 프로젝트의 전체 맥락을 파악한 뒤, 담당 업무만 수행해주세요."],
+    ["Understand the full project context, then execute only the assigned scope."],
+    ["プロジェクト全体の文脈を把握したうえで、担当範囲のみを実行してください。"],
+    ["先理解项目全局上下文，再只执行你负责的范围。"],
+  ), lang);
 
   return [
-    `[프로젝트 협업 업무 - ${targetDeptName}]`,
+    header,
     ``,
-    `원본 업무: ${parentTask.title}`,
-    parentTask.description ? `CEO 요청: ${parentTask.description}` : "",
+    `${originalTaskLabel}: ${parentTask.title}`,
+    parentTask.description ? `${ceoRequestLabel}: ${parentTask.description}` : "",
     ``,
-    `[전체 서브태스크 현황]`,
+    `[${allSubtasksLabel}]`,
     subtaskLines,
     ``,
-    `[${targetDeptName} 담당 업무]`,
-    `제목: ${subtask.title}`,
-    subtask.description ? `설명: ${subtask.description}` : "",
+    deptOwnedLabel,
+    `${titleLabel}: ${subtask.title}`,
+    subtask.description ? `${descriptionLabel}: ${subtask.description}` : "",
     conversationCtx ? `\n${conversationCtx}` : "",
     ``,
     `---`,
-    `Agent: ${execAgent.name_ko || execAgent.name} (${roleLabel}, ${targetDeptName})`,
+    `Agent: ${agentDisplayName} (${roleLabel}, ${targetDeptName})`,
     execAgent.personality ? `Personality: ${execAgent.personality}` : "",
     deptConstraint,
     ``,
-    `위 프로젝트의 전체 맥락을 파악한 뒤, 담당 업무만 수행해주세요.`,
+    finalInstruction,
   ].filter(Boolean).join("\n");
 }
 
@@ -4175,8 +5040,14 @@ function processSubtaskDelegations(taskId: string): void {
     "SELECT * FROM tasks WHERE id = ?"
   ).get(taskId) as { id: string; title: string; description: string | null; project_path: string | null; department_id: string | null } | undefined;
   if (!parentTask) return;
+  const lang = resolveLang(parentTask.description ?? parentTask.title);
 
-  notifyCeo(`'${parentTask.title}' 의 외부 부서 서브태스크 ${foreignSubtasks.length}건을 순차 위임합니다.`, taskId);
+  notifyCeo(pickL(l(
+    [`'${parentTask.title}' 의 외부 부서 서브태스크 ${foreignSubtasks.length}건을 순차 위임합니다.`],
+    [`Delegating ${foreignSubtasks.length} external-department subtasks for '${parentTask.title}' in sequence.`],
+    [`'${parentTask.title}' の他部門サブタスク${foreignSubtasks.length}件を順次委任します。`],
+    [`将按顺序委派'${parentTask.title}'的${foreignSubtasks.length}个外部门 SubTask。`],
+  ), lang), taskId);
   delegateSubtaskSequential(foreignSubtasks, 0, parentTask);
 }
 
@@ -4189,13 +5060,19 @@ function delegateSubtaskSequential(
   index: number,
   parentTask: { id: string; title: string; description: string | null; project_path: string | null; department_id: string | null },
 ): void {
+  const lang = resolveLang(parentTask.description ?? parentTask.title);
   if (index >= subtasks.length) {
     // All delegations complete — check if everything is done
     const remaining = db.prepare(
       "SELECT COUNT(*) as cnt FROM subtasks WHERE task_id = ? AND status != 'done'"
     ).get(parentTask.id) as { cnt: number };
     if (remaining.cnt === 0) {
-      notifyCeo(`'${parentTask.title}' 의 모든 서브태스크(부서간 협업 포함)가 완료되었습니다. ✅`, parentTask.id);
+      notifyCeo(pickL(l(
+        [`'${parentTask.title}' 의 모든 서브태스크(부서간 협업 포함)가 완료되었습니다. ✅`],
+        [`All subtasks for '${parentTask.title}' (including cross-department collaboration) are complete. ✅`],
+        [`'${parentTask.title}' の全サブタスク（部門間協業含む）が完了しました。✅`],
+        [`'${parentTask.title}'的全部 SubTask（含跨部门协作）已完成。✅`],
+      ), lang), parentTask.id);
     }
     return;
   }
@@ -4218,19 +5095,31 @@ function delegateSubtaskSequential(
 
   // Find the originator team leader for messaging
   const originLeader = findTeamLeader(parentTask.department_id);
-  const originLeaderName = originLeader?.name_ko || originLeader?.name || "팀장";
-  const crossLeaderName = crossLeader.name_ko || crossLeader.name;
+  const originLeaderName = originLeader
+    ? getAgentDisplayName(originLeader, lang)
+    : pickL(l(["팀장"], ["Team Lead"], ["チームリーダー"], ["组长"]), lang);
+  const crossLeaderName = getAgentDisplayName(crossLeader, lang);
 
   // Notify queue progress
   if (subtasks.length > 1) {
-    notifyCeo(`서브태스크 위임 진행: ${targetDeptName} (${index + 1}/${subtasks.length})`, parentTask.id);
+    notifyCeo(pickL(l(
+      [`서브태스크 위임 진행: ${targetDeptName} (${index + 1}/${subtasks.length})`],
+      [`Subtask delegation in progress: ${targetDeptName} (${index + 1}/${subtasks.length})`],
+      [`サブタスク委任進行中: ${targetDeptName} (${index + 1}/${subtasks.length})`],
+      [`SubTask 委派进行中：${targetDeptName}（${index + 1}/${subtasks.length}）`],
+    ), lang), parentTask.id);
   }
 
   // Send cooperation request message
   if (originLeader) {
     sendAgentMessage(
       originLeader,
-      `${crossLeaderName}님, '${parentTask.title}' 프로젝트의 서브태스크 "${subtask.title}" 협조 부탁드립니다! 🤝`,
+      pickL(l(
+        [`${crossLeaderName}님, '${parentTask.title}' 프로젝트의 서브태스크 "${subtask.title}" 협조 부탁드립니다! 🤝`],
+        [`${crossLeaderName}, please support subtask "${subtask.title}" for project '${parentTask.title}'! 🤝`],
+        [`${crossLeaderName}さん、'${parentTask.title}' のサブタスク「${subtask.title}」の協力をお願いします！🤝`],
+        [`${crossLeaderName}，请协助项目'${parentTask.title}'的 SubTask「${subtask.title}」！🤝`],
+      ), lang),
       "chat", "agent", crossLeader.id, parentTask.id,
     );
   }
@@ -4247,25 +5136,46 @@ function delegateSubtaskSequential(
   setTimeout(() => {
     const crossSub = findBestSubordinate(targetDeptId, crossLeader.id);
     const execAgent = crossSub || crossLeader;
-    const execName = execAgent.name_ko || execAgent.name;
+    const execName = getAgentDisplayName(execAgent, lang);
 
     // Acknowledge
     sendAgentMessage(
       crossLeader,
       crossSub
-        ? `네, ${originLeaderName}님! "${subtask.title}" 건, ${execName}에게 배정하겠습니다 👍`
-        : `네, ${originLeaderName}님! "${subtask.title}" 건, 제가 직접 처리하겠습니다 👍`,
+        ? pickL(l(
+          [`네, ${originLeaderName}님! "${subtask.title}" 건, ${execName}에게 배정하겠습니다 👍`],
+          [`Got it, ${originLeaderName}! I'll assign "${subtask.title}" to ${execName}. 👍`],
+          [`了解です、${originLeaderName}さん！「${subtask.title}」は${execName}に割り当てます 👍`],
+          [`收到，${originLeaderName}！「${subtask.title}」我会分配给${execName} 👍`],
+        ), lang)
+        : pickL(l(
+          [`네, ${originLeaderName}님! "${subtask.title}" 건, 제가 직접 처리하겠습니다 👍`],
+          [`Understood, ${originLeaderName}! I'll handle "${subtask.title}" myself. 👍`],
+          [`承知しました、${originLeaderName}さん！「${subtask.title}」は私が直接対応します 👍`],
+          [`明白，${originLeaderName}！「${subtask.title}」由我亲自处理 👍`],
+        ), lang),
       "chat", "agent", null, parentTask.id,
     );
 
     // Create delegated task
     const delegatedTaskId = randomUUID();
     const ct = nowMs();
-    const delegatedTitle = `[서브태스크 협업] ${subtask.title}`;
+    const delegatedTitle = pickL(l(
+      [`[서브태스크 협업] ${subtask.title}`],
+      [`[Subtask Collaboration] ${subtask.title}`],
+      [`[サブタスク協業] ${subtask.title}`],
+      [`[SubTask 协作] ${subtask.title}`],
+    ), lang);
+    const delegatedDescription = pickL(l(
+      [`[서브태스크 위임 from ${getDeptName(parentTask.department_id ?? "")}] ${parentTask.description || parentTask.title}`],
+      [`[Subtask delegated from ${getDeptName(parentTask.department_id ?? "")}] ${parentTask.description || parentTask.title}`],
+      [`[サブタスク委任元 ${getDeptName(parentTask.department_id ?? "")}] ${parentTask.description || parentTask.title}`],
+      [`[SubTask 委派来源 ${getDeptName(parentTask.department_id ?? "")}] ${parentTask.description || parentTask.title}`],
+    ), lang);
     db.prepare(`
       INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, project_path, created_at, updated_at)
       VALUES (?, ?, ?, ?, 'planned', 1, 'general', ?, ?, ?)
-    `).run(delegatedTaskId, delegatedTitle, `[서브태스크 위임 from ${getDeptName(parentTask.department_id ?? "")}] ${parentTask.description || parentTask.title}`, targetDeptId, parentTask.project_path, ct, ct);
+    `).run(delegatedTaskId, delegatedTitle, delegatedDescription, targetDeptId, parentTask.project_path, ct, ct);
     appendTaskLog(delegatedTaskId, "system", `Subtask delegation from '${parentTask.title}' → ${targetDeptName}`);
     broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(delegatedTaskId));
 
@@ -4321,7 +5231,12 @@ function delegateSubtaskSequential(
         handleSubtaskDelegationComplete(delegatedTaskId, subtask.id, code ?? 1);
       });
 
-      notifyCeo(`${targetDeptName} ${execName}가 서브태스크 '${subtask.title}' 작업을 시작했습니다.`, delegatedTaskId);
+      notifyCeo(pickL(l(
+        [`${targetDeptName} ${execName}가 서브태스크 '${subtask.title}' 작업을 시작했습니다.`],
+        [`${targetDeptName} ${execName} started subtask '${subtask.title}'.`],
+        [`${targetDeptName}の${execName}がサブタスク「${subtask.title}」を開始しました。`],
+        [`${targetDeptName} 的 ${execName} 已开始 SubTask「${subtask.title}」。`],
+      ), lang), delegatedTaskId);
       startProgressTimer(delegatedTaskId, delegatedTitle, targetDeptId);
     }
   }, ackDelay);
@@ -4341,9 +5256,16 @@ function handleSubtaskDelegationComplete(delegatedTaskId: string, subtaskId: str
     ).run(nowMs(), subtaskId);
   } else {
     // Mark subtask as blocked with failure reason
+    const lang = getPreferredLanguage();
+    const blockedReason = pickL(l(
+      ["위임 작업 실패"],
+      ["Delegated task failed"],
+      ["委任タスク失敗"],
+      ["委派任务失败"],
+    ), lang);
     db.prepare(
-      "UPDATE subtasks SET status = 'blocked', blocked_reason = '위임 작업 실패' WHERE id = ?"
-    ).run(subtaskId);
+      "UPDATE subtasks SET status = 'blocked', blocked_reason = ? WHERE id = ?"
+    ).run(blockedReason, subtaskId);
   }
 
   const updatedSub = db.prepare("SELECT * FROM subtasks WHERE id = ?").get(subtaskId);
@@ -4356,9 +5278,15 @@ function handleSubtaskDelegationComplete(delegatedTaskId: string, subtaskId: str
       "SELECT COUNT(*) as cnt FROM subtasks WHERE task_id = ? AND status != 'done'"
     ).get(sub.task_id) as { cnt: number };
     if (remaining.cnt === 0) {
-      const parentTask = db.prepare("SELECT title, status FROM tasks WHERE id = ?").get(sub.task_id) as { title: string; status: string } | undefined;
+      const parentTask = db.prepare("SELECT title, description, status FROM tasks WHERE id = ?").get(sub.task_id) as { title: string; description: string | null; status: string } | undefined;
       if (parentTask) {
-        notifyCeo(`'${parentTask.title}' 의 모든 서브태스크(부서간 협업 포함)가 완료되었습니다. ✅`, sub.task_id);
+        const lang = resolveLang(parentTask.description ?? parentTask.title);
+        notifyCeo(pickL(l(
+          [`'${parentTask.title}' 의 모든 서브태스크(부서간 협업 포함)가 완료되었습니다. ✅`],
+          [`All subtasks for '${parentTask.title}' (including cross-department collaboration) are complete. ✅`],
+          [`'${parentTask.title}' の全サブタスク（部門間協業含む）が完了しました。✅`],
+          [`'${parentTask.title}'的全部 SubTask（含跨部门协作）已完成。✅`],
+        ), lang), sub.task_id);
         if (parentTask.status === "review") {
           setTimeout(() => finishReview(sub.task_id, parentTask.title), 1200);
         }
@@ -4380,7 +5308,7 @@ interface CrossDeptContext {
   leaderDeptId: string;
   leaderDeptName: string;
   leaderName: string;
-  lang: string;
+  lang: Lang;
   taskId: string;
 }
 
@@ -4410,7 +5338,12 @@ function startCrossDeptCooperation(
   // Notify remaining queue
   if (deptIds.length > 1) {
     const remaining = deptIds.length - index;
-    notifyCeo(`협업 요청 진행 중: ${crossDeptName} (${index + 1}/${deptIds.length}, 남은 ${remaining}팀 순차 진행)`, taskId);
+    notifyCeo(pickL(l(
+      [`협업 요청 진행 중: ${crossDeptName} (${index + 1}/${deptIds.length}, 남은 ${remaining}팀 순차 진행)`],
+      [`Collaboration request in progress: ${crossDeptName} (${index + 1}/${deptIds.length}, ${remaining} team(s) remaining in queue)`],
+      [`協業依頼進行中: ${crossDeptName} (${index + 1}/${deptIds.length}、残り${remaining}チーム)`],
+      [`协作请求进行中：${crossDeptName}（${index + 1}/${deptIds.length}，队列剩余${remaining}个团队）`],
+    ), lang), taskId);
   }
 
   const coopReq = pickL(l(
@@ -4454,7 +5387,12 @@ function startCrossDeptCooperation(
     // Create actual task in the cross-department
     const crossTaskId = randomUUID();
     const ct = nowMs();
-    const crossTaskTitle = `[협업] ${taskTitle}`;
+    const crossTaskTitle = pickL(l(
+      [`[협업] ${taskTitle}`],
+      [`[Collaboration] ${taskTitle}`],
+      [`[協業] ${taskTitle}`],
+      [`[协作] ${taskTitle}`],
+    ), lang);
     const crossDetectedPath = detectProjectPath(ceoMessage);
     db.prepare(`
       INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, project_path, created_at, updated_at)
@@ -4524,7 +5462,12 @@ function startCrossDeptCooperation(
           handleTaskRunComplete(crossTaskId, code ?? 1);
         });
 
-        notifyCeo(`${crossDeptName} ${execName}가 '${taskTitle}' 협업 작업을 시작했습니다.`, crossTaskId);
+        notifyCeo(pickL(l(
+          [`${crossDeptName} ${execName}가 '${taskTitle}' 협업 작업을 시작했습니다.`],
+          [`${crossDeptName} ${execName} started collaboration work for '${taskTitle}'.`],
+          [`${crossDeptName}の${execName}が「${taskTitle}」の協業作業を開始しました。`],
+          [`${crossDeptName} 的 ${execName} 已开始「${taskTitle}」协作工作。`],
+        ), lang), crossTaskId);
         startProgressTimer(crossTaskId, crossTaskData.title, crossDeptId);
       }
     }
@@ -4610,7 +5553,7 @@ function handleTaskDelegation(
   ceoMessage: string,
   ceoMsgId: string,
 ): void {
-  const lang = detectLang(ceoMessage);
+  const lang = resolveLang(ceoMessage);
   const leaderName = lang === "ko" ? (teamLeader.name_ko || teamLeader.name) : teamLeader.name;
   const leaderDeptId = teamLeader.department_id!;
   const leaderDeptName = getDeptName(leaderDeptId);
@@ -4643,9 +5586,14 @@ function handleTaskDelegation(
     if (isPlanningLead) {
       const relatedLabel = mentionedDepts.length > 0
         ? mentionedDepts.map(getDeptName).join(", ")
-        : "없음";
+        : pickL(l(["없음"], ["None"], ["なし"], ["无"]), lang);
       appendTaskLog(taskId, "system", `Planning pre-check related departments: ${relatedLabel}`);
-      notifyCeo(`[기획팀] '${taskTitle}' 유관부서 사전 파악 완료: ${relatedLabel}`, taskId);
+      notifyCeo(pickL(l(
+        [`[기획팀] '${taskTitle}' 유관부서 사전 파악 완료: ${relatedLabel}`],
+        [`[Planning] Related departments identified for '${taskTitle}': ${relatedLabel}`],
+        [`[企画] '${taskTitle}' の関連部門の事前把握が完了: ${relatedLabel}`],
+        [`[企划] 已完成'${taskTitle}'相关部门预识别：${relatedLabel}`],
+      ), lang), taskId);
     }
 
     const runCrossDeptBeforeDelegationIfNeeded = (next: () => void) => {
@@ -4655,13 +5603,23 @@ function handleTaskDelegation(
       }
 
       const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
-      notifyCeo(`[CEO OFFICE] 기획팀 선행 협업 처리 시작: ${crossDeptNames}`, taskId);
+      notifyCeo(pickL(l(
+        [`[CEO OFFICE] 기획팀 선행 협업 처리 시작: ${crossDeptNames}`],
+        [`[CEO OFFICE] Planning pre-collaboration started with: ${crossDeptNames}`],
+        [`[CEO OFFICE] 企画チームの先行協業を開始: ${crossDeptNames}`],
+        [`[CEO OFFICE] 企划团队前置协作已启动：${crossDeptNames}`],
+      ), lang), taskId);
       startCrossDeptCooperation(
         mentionedDepts,
         0,
         { teamLeader, taskTitle, ceoMessage, leaderDeptId, leaderDeptName, leaderName, lang, taskId },
         () => {
-          notifyCeo(`[CEO OFFICE] 유관부서 선행 처리 완료. 이제 내부 업무 하달을 시작합니다.`, taskId);
+          notifyCeo(pickL(l(
+            ["[CEO OFFICE] 유관부서 선행 처리 완료. 이제 내부 업무 하달을 시작합니다."],
+            ["[CEO OFFICE] Related-department pre-processing complete. Starting internal delegation now."],
+            ["[CEO OFFICE] 関連部門の先行処理が完了。これより内部委任を開始します。"],
+            ["[CEO OFFICE] 相关部门前置处理完成，现开始内部下达。"],
+          ), lang), taskId);
           next();
         },
       );
@@ -4693,17 +5651,17 @@ function handleTaskDelegation(
       } else if (mentionedDepts.length > 0) {
         const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
         ackMsg = pickL(l(
-          [`네, 대표님! 확인했습니다. ${subRole} ${subName}에게 할당하고, ${crossDeptNames}에도 협조 요청하겠습니다! 📋`, `알겠습니다! ${subName}가 메인으로 진행하고, ${crossDeptNames}과 협업 조율하겠습니다 🤝`],
-          [`Got it! I'll assign this to ${subRole} ${subName} and coordinate with ${crossDeptNames} 📋`, `Understood! ${subName} will take the lead, and I'll loop in ${crossDeptNames} 🤝`],
-          [`了解しました！${subRole} ${subName}に割り当て、${crossDeptNames}にも協力依頼します！📋`],
-          [`收到！交给${subRole} ${subName}，同时协调${crossDeptNames} 📋`],
+          [`네, 대표님! 먼저 팀장 승인 회의를 진행한 뒤 ${subRole} ${subName}에게 하달하고, ${crossDeptNames} 협업도 연계하겠습니다. 📋`, `알겠습니다! 팀장 회의에서 착수안 승인 완료 후 ${subName} 배정과 ${crossDeptNames} 협업 조율을 진행하겠습니다 🤝`],
+          [`Understood. We'll run the team-lead approval meeting first, then delegate to ${subRole} ${subName} and coordinate with ${crossDeptNames}. 📋`, `Got it. After kickoff approval in the leaders' meeting, I'll assign ${subName} and sync with ${crossDeptNames}. 🤝`],
+          [`了解しました。まずチームリーダー承認会議を行い、その後 ${subRole} ${subName} へ委任し、${crossDeptNames} との協業も調整します。📋`],
+          [`收到。先进行团队负责人审批会议，审批后再下达给${subRole} ${subName}，并协调${crossDeptNames}协作。📋`],
         ), lang);
       } else {
         ackMsg = pickL(l(
-          [`네, 대표님! 확인했습니다. ${subRole} ${subName}에게 바로 할당하겠습니다! 📋`, `알겠습니다! 우리 팀 ${subName}가 적임자입니다. 바로 지시하겠습니다 🚀`, `확인했습니다, 대표님! ${subName}에게 전달하고 진행 관리하겠습니다.`],
-          [`Got it! I'll assign this to ${subRole} ${subName} right away! 📋`, `Understood! ${subName} is the perfect fit. Delegating now 🚀`, `Confirmed! I'll hand this off to ${subName} and manage progress.`],
-          [`了解しました！${subRole} ${subName}にすぐ割り当てます！📋`, `承知しました！${subName}に指示します 🚀`],
-          [`收到！马上分配给${subRole} ${subName}！📋`, `明白！${subName}最合适，立即安排 🚀`],
+          [`네, 대표님! 먼저 팀장 승인 회의를 소집하고, 승인 완료 후 ${subRole} ${subName}에게 하달하겠습니다. 📋`, `알겠습니다! 우리 팀 ${subName}가 적임자이며, 회의 승인 직후 지시하겠습니다. 🚀`, `확인했습니다, 대표님! 팀장 회의 후 ${subName}에게 전달하고 진행 관리하겠습니다.`],
+          [`Understood. I'll convene the team-lead approval meeting first, then assign to ${subRole} ${subName} after approval. 📋`, `Got it. ${subName} is the best fit, and I'll delegate right after leaders approve. 🚀`, `Confirmed. After the leaders' meeting, I'll hand this off to ${subName} and manage execution.`],
+          [`了解しました。まずチームリーダー承認会議を招集し、承認後に ${subRole} ${subName} へ委任します。📋`, `承知しました。${subName} が最適任なので、会議承認直後に指示します。🚀`],
+          [`收到。先召集团队负责人审批会议，审批通过后再分配给${subRole} ${subName}。📋`, `明白。${subName}最合适，会在会议批准后立即下达。🚀`],
         ), lang);
       }
       sendAgentMessage(teamLeader, ackMsg, "chat", "agent", null, taskId);
@@ -4754,10 +5712,10 @@ function handleTaskDelegation(
     } else {
       // No subordinate — team leader handles it themselves
       const selfMsg = pickL(l(
-        [`네, 대표님! 확인했습니다. 현재 팀원들이 모두 업무 중이라 제가 직접 처리하겠습니다! 💪`, `알겠습니다! 팀 내 여유 인력이 없어서 제가 직접 진행하겠습니다.`],
-        [`Got it! All team members are busy, so I'll handle this personally! 💪`, `Understood! No one's available, so I'll take this on myself.`],
-        [`了解しました！チームメンバーが全員稼働中なので、私が直接対応します！💪`],
-        [`收到！团队都在忙，我亲自来处理！💪`],
+        [`네, 대표님! 먼저 팀장 승인 회의를 진행하고, 팀 내 가용 인력이 없어 승인 후 제가 직접 처리하겠습니다. 💪`, `알겠습니다! 팀장 회의 승인 완료 후 제가 직접 진행하겠습니다.`],
+        [`Understood. We'll complete the team-lead approval meeting first, and since no one is available I'll execute it myself after approval. 💪`, `Got it. I'll proceed personally after the leaders' approval meeting.`],
+        [`了解しました。まずチームリーダー承認会議を行い、空き要員がいないため承認後は私が直接対応します。💪`],
+        [`收到。先进行团队负责人审批会议，因无可用成员，审批后由我亲自执行。💪`],
       ), lang);
       sendAgentMessage(teamLeader, selfMsg, "chat", "agent", null, taskId);
 
@@ -4794,11 +5752,32 @@ function scheduleAgentReply(agentId: string, ceoMessage: string, messageType: st
     return;
   }
 
-  // Regular chat reply
+  if (agent.status === "offline") {
+    const lang = resolveLang(ceoMessage);
+    sendAgentMessage(agent, buildCliFailureMessage(agent, lang, "offline"));
+    return;
+  }
+
+  // Regular 1:1 reply via real CLI run
   const delay = 1000 + Math.random() * 2000;
   setTimeout(() => {
-    const reply = generateChatReply(agent, ceoMessage);
-    sendAgentMessage(agent, reply);
+    void (async () => {
+      const activeTask = agent.current_task_id
+        ? db.prepare("SELECT title, description, project_path FROM tasks WHERE id = ?").get(agent.current_task_id) as {
+          title: string;
+          description: string | null;
+          project_path: string | null;
+        } | undefined
+        : undefined;
+      const detectedPath = detectProjectPath(ceoMessage);
+      const projectPath = detectedPath
+        || (activeTask ? resolveProjectPath(activeTask) : process.cwd());
+
+      const built = buildDirectReplyPrompt(agent, ceoMessage, messageType);
+      const run = await runAgentOneShot(agent, built.prompt, { projectPath });
+      const reply = chooseSafeReply(run, built.lang, "direct", agent);
+      sendAgentMessage(agent, reply);
+    })();
   }, delay);
 }
 
@@ -4890,7 +5869,7 @@ app.post("/api/messages", (req, res) => {
     if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
       const senderAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(receiverId) as AgentRow | undefined;
       if (senderAgent) {
-        const lang = detectLang(content);
+        const lang = resolveLang(content);
         const mentionDelay = 4000 + Math.random() * 2000; // After the main delegation starts
         setTimeout(() => {
           // Handle department mentions
@@ -4949,7 +5928,6 @@ app.post("/api/announcements", (req, res) => {
   // Check for @mentions in announcements — trigger delegation
   const mentions = detectMentions(content);
   if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
-    const lang = detectLang(content);
     const mentionDelay = 5000 + Math.random() * 2000;
     setTimeout(() => {
       const processedDepts = new Set<string>();
@@ -5161,6 +6139,9 @@ function prettyStreamJson(raw: string): string {
         continue;
       }
 
+      // Claude: skip noise types
+      if (j.type === "user" || j.type === "rate_limit_event") continue;
+
       // Claude: stream_event
       if (j.type === "stream_event") {
         const ev = j.event;
@@ -5172,6 +6153,10 @@ function prettyStreamJson(raw: string): string {
           chunks.push(ev.content_block.text);
           continue;
         }
+        if (ev?.type === "content_block_start" && ev?.content_block?.type === "tool_use") {
+          chunks.push(`\n[tool: ${ev.content_block.name}]\n`);
+          continue;
+        }
         continue;
       }
 
@@ -5180,6 +6165,15 @@ function prettyStreamJson(raw: string): string {
         for (const block of j.message.content) {
           if (block.type === "text" && block.text) {
             chunks.push(block.text);
+          }
+          if (block.type === "tool_use" && block.name) {
+            const inp = block.input || {};
+            const key = inp.file_path || inp.command || inp.pattern || inp.description || inp.prompt || "";
+            const short = String(key).split("\n")[0].slice(0, 120);
+            chunks.push(`\n[tool: ${block.name}] ${short}\n`);
+          }
+          if (block.type === "thinking" && block.thinking) {
+            chunks.push(`\n[thinking] ${block.thinking}\n`);
           }
         }
         continue;

@@ -3,6 +3,8 @@
  * Handles: tables, bold, italic, links, inline code, code blocks, headers, lists.
  */
 
+import type { JSX } from "react";
+
 interface MessageContentProps {
   content: string;
   className?: string;

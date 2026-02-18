@@ -24,15 +24,73 @@ interface TaskBoardProps {
   onPauseTask?: (id: string) => void;
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
+  onOpenMeetingMinutes?: (taskId: string) => void;
   onMergeTask?: (id: string) => void;
   onDiscardTask?: (id: string) => void;
+}
+
+type Locale = 'ko' | 'en' | 'ja' | 'zh';
+type TFunction = (messages: Record<Locale, string>) => string;
+
+const LANGUAGE_STORAGE_KEY = 'climpire.language';
+const LOCALE_TAGS: Record<Locale, string> = {
+  ko: 'ko-KR',
+  en: 'en-US',
+  ja: 'ja-JP',
+  zh: 'zh-CN',
+};
+
+function normalizeLocale(value: string | null | undefined): Locale | null {
+  const code = (value ?? '').toLowerCase();
+  if (code.startsWith('ko')) return 'ko';
+  if (code.startsWith('en')) return 'en';
+  if (code.startsWith('ja')) return 'ja';
+  if (code.startsWith('zh')) return 'zh';
+  return null;
+}
+
+function detectLocale(): Locale {
+  if (typeof window === 'undefined') return 'en';
+  return (
+    normalizeLocale(window.localStorage.getItem(LANGUAGE_STORAGE_KEY)) ??
+    normalizeLocale(window.navigator.language) ??
+    'en'
+  );
+}
+
+function useI18n(preferredLocale?: string) {
+  const [locale, setLocale] = useState<Locale>(() => normalizeLocale(preferredLocale) ?? detectLocale());
+
+  useEffect(() => {
+    const preferred = normalizeLocale(preferredLocale);
+    if (preferred) setLocale(preferred);
+  }, [preferredLocale]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const sync = () => {
+      setLocale(normalizeLocale(preferredLocale) ?? detectLocale());
+    };
+    window.addEventListener('storage', sync);
+    window.addEventListener('climpire-language-change', sync as EventListener);
+    return () => {
+      window.removeEventListener('storage', sync);
+      window.removeEventListener('climpire-language-change', sync as EventListener);
+    };
+  }, [preferredLocale]);
+
+  const t = useCallback(
+    (messages: Record<Locale, string>) => messages[locale] ?? messages.en,
+    [locale],
+  );
+
+  return { locale, localeTag: LOCALE_TAGS[locale], t };
 }
 
 // ── Column config ──────────────────────────────────────────────────────────────
 
 const COLUMNS: {
   status: TaskStatus;
-  label: string;
   icon: string;
   headerBg: string;
   borderColor: string;
@@ -40,7 +98,6 @@ const COLUMNS: {
 }[] = [
   {
     status: 'inbox',
-    label: 'Inbox',
     icon: '📥',
     headerBg: 'bg-slate-800',
     borderColor: 'border-slate-600',
@@ -48,7 +105,6 @@ const COLUMNS: {
   },
   {
     status: 'planned',
-    label: 'Planned',
     icon: '📋',
     headerBg: 'bg-blue-900',
     borderColor: 'border-blue-700',
@@ -56,7 +112,6 @@ const COLUMNS: {
   },
   {
     status: 'in_progress',
-    label: 'In Progress',
     icon: '⚡',
     headerBg: 'bg-amber-900',
     borderColor: 'border-amber-700',
@@ -64,7 +119,6 @@ const COLUMNS: {
   },
   {
     status: 'review',
-    label: 'Review',
     icon: '🔍',
     headerBg: 'bg-purple-900',
     borderColor: 'border-purple-700',
@@ -72,7 +126,6 @@ const COLUMNS: {
   },
   {
     status: 'done',
-    label: 'Done',
     icon: '✅',
     headerBg: 'bg-green-900',
     borderColor: 'border-green-700',
@@ -80,7 +133,6 @@ const COLUMNS: {
   },
   {
     status: 'pending',
-    label: 'Pending',
     icon: '⏸️',
     headerBg: 'bg-orange-900',
     borderColor: 'border-orange-700',
@@ -88,7 +140,6 @@ const COLUMNS: {
   },
   {
     status: 'cancelled',
-    label: 'Cancelled',
     icon: '🚫',
     headerBg: 'bg-red-900',
     borderColor: 'border-red-700',
@@ -96,27 +147,68 @@ const COLUMNS: {
   },
 ];
 
-const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
-  { value: 'inbox', label: 'Inbox' },
-  { value: 'planned', label: 'Planned' },
-  { value: 'in_progress', label: 'In Progress' },
-  { value: 'review', label: 'Review' },
-  { value: 'done', label: 'Done' },
-  { value: 'pending', label: 'Pending' },
-  { value: 'cancelled', label: 'Cancelled' },
+const STATUS_OPTIONS: TaskStatus[] = [
+  'inbox',
+  'planned',
+  'in_progress',
+  'review',
+  'done',
+  'pending',
+  'cancelled',
 ];
 
-const TASK_TYPE_OPTIONS: { value: TaskType; label: string; color: string }[] = [
-  { value: 'general', label: 'General', color: 'bg-slate-700 text-slate-300' },
-  { value: 'development', label: 'Development', color: 'bg-cyan-900 text-cyan-300' },
-  { value: 'design', label: 'Design', color: 'bg-pink-900 text-pink-300' },
-  { value: 'analysis', label: 'Analysis', color: 'bg-indigo-900 text-indigo-300' },
-  { value: 'presentation', label: 'Presentation', color: 'bg-orange-900 text-orange-300' },
-  { value: 'documentation', label: 'Documentation', color: 'bg-teal-900 text-teal-300' },
+const TASK_TYPE_OPTIONS: { value: TaskType; color: string }[] = [
+  { value: 'general', color: 'bg-slate-700 text-slate-300' },
+  { value: 'development', color: 'bg-cyan-900 text-cyan-300' },
+  { value: 'design', color: 'bg-pink-900 text-pink-300' },
+  { value: 'analysis', color: 'bg-indigo-900 text-indigo-300' },
+  { value: 'presentation', color: 'bg-orange-900 text-orange-300' },
+  { value: 'documentation', color: 'bg-teal-900 text-teal-300' },
 ];
 
-function getTaskTypeBadge(type: TaskType) {
-  return TASK_TYPE_OPTIONS.find((t) => t.value === type) ?? TASK_TYPE_OPTIONS[0];
+function taskStatusLabel(status: TaskStatus, t: TFunction) {
+  switch (status) {
+    case 'inbox':
+      return t({ ko: '수신함', en: 'Inbox', ja: '受信箱', zh: '收件箱' });
+    case 'planned':
+      return t({ ko: '계획됨', en: 'Planned', ja: '計画済み', zh: '已计划' });
+    case 'in_progress':
+      return t({ ko: '진행 중', en: 'In Progress', ja: '進行中', zh: '进行中' });
+    case 'review':
+      return t({ ko: '검토', en: 'Review', ja: 'レビュー', zh: '审核' });
+    case 'done':
+      return t({ ko: '완료', en: 'Done', ja: '完了', zh: '完成' });
+    case 'pending':
+      return t({ ko: '보류', en: 'Pending', ja: '保留', zh: '待处理' });
+    case 'cancelled':
+      return t({ ko: '취소', en: 'Cancelled', ja: 'キャンセル', zh: '已取消' });
+    default:
+      return status;
+  }
+}
+
+function taskTypeLabel(type: TaskType, t: TFunction) {
+  switch (type) {
+    case 'general':
+      return t({ ko: '일반', en: 'General', ja: '一般', zh: '通用' });
+    case 'development':
+      return t({ ko: '개발', en: 'Development', ja: '開発', zh: '开发' });
+    case 'design':
+      return t({ ko: '디자인', en: 'Design', ja: 'デザイン', zh: '设计' });
+    case 'analysis':
+      return t({ ko: '분석', en: 'Analysis', ja: '分析', zh: '分析' });
+    case 'presentation':
+      return t({ ko: '발표', en: 'Presentation', ja: 'プレゼン', zh: '演示' });
+    case 'documentation':
+      return t({ ko: '문서화', en: 'Documentation', ja: 'ドキュメント', zh: '文档' });
+    default:
+      return type;
+  }
+}
+
+function getTaskTypeBadge(type: TaskType, t: TFunction) {
+  const option = TASK_TYPE_OPTIONS.find((entry) => entry.value === type) ?? TASK_TYPE_OPTIONS[0];
+  return { ...option, label: taskTypeLabel(option.value, t) };
 }
 
 function priorityIcon(p: number) {
@@ -125,20 +217,21 @@ function priorityIcon(p: number) {
   return '🟢';
 }
 
-function priorityLabel(p: number) {
-  if (p >= 4) return 'High';
-  if (p >= 2) return 'Medium';
-  return 'Low';
+function priorityLabel(p: number, t: TFunction) {
+  if (p >= 4) return t({ ko: '높음', en: 'High', ja: '高', zh: '高' });
+  if (p >= 2) return t({ ko: '중간', en: 'Medium', ja: '中', zh: '中' });
+  return t({ ko: '낮음', en: 'Low', ja: '低', zh: '低' });
 }
 
-function timeAgo(ts: number): string {
+function timeAgo(ts: number, localeTag: string): string {
   const diffSec = Math.floor((Date.now() - ts) / 1000);
-  if (diffSec < 60) return `${diffSec}s ago`;
+  const rtf = new Intl.RelativeTimeFormat(localeTag, { numeric: 'auto' });
+  if (diffSec < 60) return rtf.format(-diffSec, 'second');
   const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
+  if (diffMin < 60) return rtf.format(-diffMin, 'minute');
   const diffH = Math.floor(diffMin / 60);
-  if (diffH < 24) return `${diffH}h ago`;
-  return `${Math.floor(diffH / 24)}d ago`;
+  if (diffH < 24) return rtf.format(-diffH, 'hour');
+  return rtf.format(-Math.floor(diffH / 24), 'day');
 }
 
 // ── Create Modal ──────────────────────────────────────────────────────────────
@@ -152,6 +245,7 @@ interface CreateModalProps {
 }
 
 function CreateModal({ agents, departments, onClose, onCreate, onAssign }: CreateModalProps) {
+  const { t, locale } = useI18n();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [departmentId, setDepartmentId] = useState('');
@@ -203,10 +297,13 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
     >
       <div className="w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
         <div className="mb-5 flex items-center justify-between">
-          <h2 className="text-lg font-bold text-white">새 업무 만들기</h2>
+          <h2 className="text-lg font-bold text-white">
+            {t({ ko: '새 업무 만들기', en: 'Create New Task', ja: '新しいタスクを作成', zh: '创建新任务' })}
+          </h2>
           <button
             onClick={onClose}
             className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+            title={t({ ko: '닫기', en: 'Close', ja: '閉じる', zh: '关闭' })}
           >
             ✕
           </button>
@@ -216,13 +313,19 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
           {/* Title */}
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-300">
-              제목 <span className="text-red-400">*</span>
+              {t({ ko: '제목', en: 'Title', ja: 'タイトル', zh: '标题' })}{' '}
+              <span className="text-red-400">*</span>
             </label>
             <input
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="업무 제목을 입력하세요"
+              placeholder={t({
+                ko: '업무 제목을 입력하세요',
+                en: 'Enter a task title',
+                ja: 'タスクのタイトルを入力してください',
+                zh: '请输入任务标题',
+              })}
               required
               className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
             />
@@ -230,11 +333,18 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
 
           {/* Description */}
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-300">설명</label>
+            <label className="mb-1 block text-sm font-medium text-slate-300">
+              {t({ ko: '설명', en: 'Description', ja: '説明', zh: '说明' })}
+            </label>
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="업무에 대한 상세 설명을 입력하세요"
+              placeholder={t({
+                ko: '업무에 대한 상세 설명을 입력하세요',
+                en: 'Enter a detailed description',
+                ja: 'タスクの詳細説明を入力してください',
+                zh: '请输入任务详细说明',
+              })}
               rows={3}
               className="w-full resize-none rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
             />
@@ -243,7 +353,9 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
           {/* Department + Task Type */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="mb-1 block text-sm font-medium text-slate-300">부서</label>
+              <label className="mb-1 block text-sm font-medium text-slate-300">
+                {t({ ko: '부서', en: 'Department', ja: '部署', zh: '部门' })}
+              </label>
               <select
                 value={departmentId}
                 onChange={(e) => {
@@ -252,25 +364,29 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
                 }}
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
               >
-                <option value="">-- 전체 --</option>
+                <option value="">
+                  {t({ ko: '-- 전체 --', en: '-- All --', ja: '-- 全体 --', zh: '-- 全部 --' })}
+                </option>
                 {departments.map((d) => (
                   <option key={d.id} value={d.id}>
-                    {d.icon} {d.name_ko}
+                    {d.icon} {locale === 'ko' ? d.name_ko : d.name}
                   </option>
                 ))}
               </select>
             </div>
 
             <div>
-              <label className="mb-1 block text-sm font-medium text-slate-300">업무 유형</label>
+              <label className="mb-1 block text-sm font-medium text-slate-300">
+                {t({ ko: '업무 유형', en: 'Task Type', ja: 'タスク種別', zh: '任务类型' })}
+              </label>
               <select
                 value={taskType}
                 onChange={(e) => setTaskType(e.target.value as TaskType)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
               >
-                {TASK_TYPE_OPTIONS.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
+                {TASK_TYPE_OPTIONS.map((typeOption) => (
+                  <option key={typeOption.value} value={typeOption.value}>
+                    {taskTypeLabel(typeOption.value, t)}
                   </option>
                 ))}
               </select>
@@ -280,7 +396,8 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
           {/* Priority */}
           <div>
             <label className="mb-2 block text-sm font-medium text-slate-300">
-              우선순위: {priorityIcon(priority)} {priorityLabel(priority)} ({priority}/5)
+              {t({ ko: '우선순위', en: 'Priority', ja: '優先度', zh: '优先级' })}: {priorityIcon(priority)}{' '}
+              {priorityLabel(priority, t)} ({priority}/5)
             </label>
             <div className="flex gap-2">
               {[1, 2, 3, 4, 5].map((star) => (
@@ -302,16 +419,30 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
 
           {/* Assign Agent */}
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-300">담당 에이전트</label>
+            <label className="mb-1 block text-sm font-medium text-slate-300">
+              {t({ ko: '담당 에이전트', en: 'Assignee', ja: '担当エージェント', zh: '负责人' })}
+            </label>
             <AgentSelect
               agents={filteredAgents}
               value={assignAgentId}
               onChange={setAssignAgentId}
-              placeholder="-- 미배정 --"
+              placeholder={t({
+                ko: '-- 미배정 --',
+                en: '-- Unassigned --',
+                ja: '-- 未割り当て --',
+                zh: '-- 未分配 --',
+              })}
               size="md"
             />
             {departmentId && filteredAgents.length === 0 && (
-              <p className="mt-1 text-xs text-slate-500">해당 부서에 에이전트가 없습니다.</p>
+              <p className="mt-1 text-xs text-slate-500">
+                {t({
+                  ko: '해당 부서에 에이전트가 없습니다.',
+                  en: 'No agents are available in this department.',
+                  ja: 'この部署にはエージェントがいません。',
+                  zh: '该部门暂无可用代理。',
+                })}
+              </p>
             )}
           </div>
 
@@ -322,14 +453,14 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
               onClick={onClose}
               className="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 transition hover:bg-slate-800"
             >
-              취소
+              {t({ ko: '취소', en: 'Cancel', ja: 'キャンセル', zh: '取消' })}
             </button>
             <button
               type="submit"
               disabled={!title.trim()}
               className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              업무 만들기
+              {t({ ko: '업무 만들기', en: 'Create Task', ja: 'タスク作成', zh: '创建任务' })}
             </button>
           </div>
         </form>
@@ -343,6 +474,7 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
 // ── Diff Modal ────────────────────────────────────────────────────────────────
 
 function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+  const { t } = useI18n();
   const [diffData, setDiffData] = useState<TaskDiffResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -353,12 +485,12 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
   useEffect(() => {
     getTaskDiff(taskId)
       .then((d) => {
-        if (!d.ok) setError(d.error || 'Unknown error');
+        if (!d.ok) setError(d.error || t({ ko: '알 수 없는 오류', en: 'Unknown error', ja: '不明なエラー', zh: '未知错误' }));
         else setDiffData(d);
         setLoading(false);
       })
       .catch((e) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false); });
-  }, [taskId]);
+  }, [taskId, t]);
 
   // Close on Escape key
   useEffect(() => {
@@ -368,32 +500,69 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
   }, [onClose]);
 
   const handleMerge = useCallback(async () => {
-    if (!confirm('이 브랜치를 메인에 병합하시겠습니까?')) return;
+    if (!confirm(t({
+      ko: '이 브랜치를 메인에 병합하시겠습니까?',
+      en: 'Merge this branch into main?',
+      ja: 'このブランチを main にマージしますか？',
+      zh: '要将此分支合并到 main 吗？',
+    })))
+      return;
     setMerging(true);
     try {
       const result = await mergeTask(taskId);
-      setActionResult(result.ok ? `병합 완료: ${result.message}` : `병합 실패: ${result.message}`);
+      setActionResult(
+        result.ok
+          ? `${t({ ko: '병합 완료', en: 'Merge completed', ja: 'マージ完了', zh: '合并完成' })}: ${result.message}`
+          : `${t({ ko: '병합 실패', en: 'Merge failed', ja: 'マージ失敗', zh: '合并失败' })}: ${result.message}`,
+      );
       if (result.ok) setTimeout(onClose, 1500);
     } catch (e: unknown) {
-      setActionResult(`오류: ${e instanceof Error ? e.message : String(e)}`);
+      setActionResult(
+        `${t({ ko: '오류', en: 'Error', ja: 'エラー', zh: '错误' })}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
     } finally {
       setMerging(false);
     }
-  }, [taskId, onClose]);
+  }, [taskId, onClose, t]);
 
   const handleDiscard = useCallback(async () => {
-    if (!confirm('이 브랜치의 변경사항을 모두 폐기하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) return;
+    if (
+      !confirm(
+        t({
+          ko: '이 브랜치의 변경사항을 모두 폐기하시겠습니까? 이 작업은 되돌릴 수 없습니다.',
+          en: 'Discard all changes in this branch? This action cannot be undone.',
+          ja: 'このブランチの変更をすべて破棄しますか？この操作は元に戻せません。',
+          zh: '要丢弃此分支的所有更改吗？此操作无法撤销。',
+        }),
+      )
+    )
+      return;
     setDiscarding(true);
     try {
       const result = await discardTask(taskId);
-      setActionResult(result.ok ? '브랜치가 폐기되었습니다.' : `폐기 실패: ${result.message}`);
+      setActionResult(
+        result.ok
+          ? t({
+              ko: '브랜치가 폐기되었습니다.',
+              en: 'Branch was discarded.',
+              ja: 'ブランチを破棄しました。',
+              zh: '分支已丢弃。',
+            })
+          : `${t({ ko: '폐기 실패', en: 'Discard failed', ja: '破棄失敗', zh: '丢弃失败' })}: ${result.message}`,
+      );
       if (result.ok) setTimeout(onClose, 1500);
     } catch (e: unknown) {
-      setActionResult(`오류: ${e instanceof Error ? e.message : String(e)}`);
+      setActionResult(
+        `${t({ ko: '오류', en: 'Error', ja: 'エラー', zh: '错误' })}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
     } finally {
       setDiscarding(false);
     }
-  }, [taskId, onClose]);
+  }, [taskId, onClose, t]);
 
   return (
     <div
@@ -404,7 +573,9 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-700 px-5 py-3">
           <div className="flex items-center gap-2">
-            <span className="text-lg font-bold text-white">Git Diff</span>
+            <span className="text-lg font-bold text-white">
+              {t({ ko: 'Git 변경사항', en: 'Git Diff', ja: 'Git 差分', zh: 'Git 差异' })}
+            </span>
             {diffData?.branchName && (
               <span className="rounded-full bg-purple-900 px-2.5 py-0.5 text-xs text-purple-300">
                 {diffData.branchName}
@@ -417,18 +588,19 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
               disabled={merging || discarding || !diffData?.hasWorktree}
               className="rounded-lg bg-green-700 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-green-600 disabled:opacity-40"
             >
-              {merging ? '...' : 'Merge'}
+              {merging ? '...' : t({ ko: '병합', en: 'Merge', ja: 'マージ', zh: '合并' })}
             </button>
             <button
               onClick={handleDiscard}
               disabled={merging || discarding || !diffData?.hasWorktree}
               className="rounded-lg bg-red-800 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-700 disabled:opacity-40"
             >
-              {discarding ? '...' : 'Discard'}
+              {discarding ? '...' : t({ ko: '폐기', en: 'Discard', ja: '破棄', zh: '丢弃' })}
             </button>
             <button
               onClick={onClose}
               className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              title={t({ ko: '닫기', en: 'Close', ja: '閉じる', zh: '关闭' })}
             >
               X
             </button>
@@ -445,28 +617,39 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
         {/* Content */}
         <div className="flex-1 overflow-auto p-5">
           {loading ? (
-            <div className="flex items-center justify-center py-12 text-slate-400">Loading diff...</div>
+            <div className="flex items-center justify-center py-12 text-slate-400">
+              {t({ ko: '변경사항 불러오는 중...', en: 'Loading diff...', ja: '差分を読み込み中...', zh: '正在加载差异...' })}
+            </div>
           ) : error ? (
             <div className="flex items-center justify-center py-12 text-red-400">
-              Error: {error}
+              {t({ ko: '오류', en: 'Error', ja: 'エラー', zh: '错误' })}: {error}
             </div>
           ) : !diffData?.hasWorktree ? (
             <div className="flex items-center justify-center py-12 text-slate-500">
-              No worktree found for this task (non-git project or already merged)
+              {t({
+                ko: '이 작업의 워크트리를 찾을 수 없습니다. (Git 프로젝트 아님 또는 이미 병합됨)',
+                en: 'No worktree found for this task (non-git project or already merged)',
+                ja: 'このタスクのワークツリーが見つかりません（Git プロジェクトではない、または既にマージ済み）',
+                zh: '找不到该任务的 worktree（非 Git 项目或已合并）',
+              })}
             </div>
           ) : (
             <div className="space-y-4">
               {/* Stat summary */}
               {diffData.stat && (
                 <div>
-                  <h3 className="mb-1 text-sm font-semibold text-slate-300">Summary</h3>
+                  <h3 className="mb-1 text-sm font-semibold text-slate-300">
+                    {t({ ko: '요약', en: 'Summary', ja: '概要', zh: '摘要' })}
+                  </h3>
                   <pre className="rounded-lg bg-slate-800 p-3 text-xs text-slate-300 overflow-x-auto">{diffData.stat}</pre>
                 </div>
               )}
               {/* Full diff */}
               {diffData.diff && (
                 <div>
-                  <h3 className="mb-1 text-sm font-semibold text-slate-300">Diff</h3>
+                  <h3 className="mb-1 text-sm font-semibold text-slate-300">
+                    {t({ ko: 'Diff', en: 'Diff', ja: '差分', zh: '差异' })}
+                  </h3>
                   <pre className="max-h-[50vh] overflow-auto rounded-lg bg-slate-950 p-3 text-xs leading-relaxed">
                     {diffData.diff.split('\n').map((line, i) => {
                       let cls = 'text-slate-400';
@@ -480,7 +663,9 @@ function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void })
                 </div>
               )}
               {!diffData.stat && !diffData.diff && (
-                <div className="text-center text-slate-500 py-8">No changes detected</div>
+                <div className="text-center text-slate-500 py-8">
+                  {t({ ko: '변경사항이 없습니다', en: 'No changes detected', ja: '変更はありません', zh: '未检测到更改' })}
+                </div>
               )}
             </div>
           )}
@@ -503,6 +688,7 @@ interface TaskCardProps {
   onPauseTask?: (id: string) => void;
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
+  onOpenMeetingMinutes?: (taskId: string) => void;
   onMergeTask?: (id: string) => void;
   onDiscardTask?: (id: string) => void;
 }
@@ -527,14 +713,16 @@ function TaskCard({
   onPauseTask,
   onResumeTask,
   onOpenTerminal,
+  onOpenMeetingMinutes,
 }: TaskCardProps) {
+  const { t, localeTag, locale } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
   const [showSubtasks, setShowSubtasks] = useState(false);
 
   const assignedAgent = task.assigned_agent ?? agents.find((a) => a.id === task.assigned_agent_id);
   const department = departments.find((d) => d.id === task.department_id);
-  const typeBadge = getTaskTypeBadge(task.task_type);
+  const typeBadge = getTaskTypeBadge(task.task_type, t);
 
   const canRun = task.status === 'planned' || task.status === 'inbox';
   const canStop = task.status === 'in_progress';
@@ -552,7 +740,10 @@ function TaskCard({
         >
           {task.title}
         </button>
-        <span className="flex-shrink-0 text-base" title={`Priority: ${priorityLabel(task.priority)}`}>
+        <span
+          className="flex-shrink-0 text-base"
+          title={`${t({ ko: '우선순위', en: 'Priority', ja: '優先度', zh: '优先级' })}: ${priorityLabel(task.priority, t)}`}
+        >
           {priorityIcon(task.priority)}
         </span>
       </div>
@@ -573,7 +764,7 @@ function TaskCard({
         </span>
         {department && (
           <span className="rounded-full bg-slate-700 px-2 py-0.5 text-xs text-slate-300">
-            {department.icon} {department.name_ko}
+            {department.icon} {locale === 'ko' ? department.name_ko : department.name}
           </span>
         )}
       </div>
@@ -585,9 +776,9 @@ function TaskCard({
           onChange={(e) => onUpdateTask(task.id, { status: e.target.value as TaskStatus })}
           className="w-full rounded-lg border border-slate-600 bg-slate-700 px-2 py-1 text-xs text-white outline-none transition focus:border-blue-500"
         >
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s.value} value={s.value}>
-              {s.label}
+          {STATUS_OPTIONS.map((status) => (
+            <option key={status} value={status}>
+              {taskStatusLabel(status, t)}
             </option>
           ))}
         </select>
@@ -599,13 +790,15 @@ function TaskCard({
           {assignedAgent ? (
             <>
               <AgentAvatar agent={assignedAgent} agents={agents} size={20} />
-              <span className="text-xs text-slate-300">{assignedAgent.name_ko}</span>
+              <span className="text-xs text-slate-300">{locale === 'ko' ? assignedAgent.name_ko : assignedAgent.name}</span>
             </>
           ) : (
-            <span className="text-xs text-slate-500">미배정</span>
+            <span className="text-xs text-slate-500">
+              {t({ ko: '미배정', en: 'Unassigned', ja: '未割り当て', zh: '未分配' })}
+            </span>
           )}
         </div>
-        <span className="text-xs text-slate-500">{timeAgo(task.created_at)}</span>
+        <span className="text-xs text-slate-500">{timeAgo(task.created_at, localeTag)}</span>
       </div>
 
       {/* Assign agent dropdown */}
@@ -662,7 +855,12 @@ function TaskCard({
                       </span>
                     )}
                     {st.delegated_task_id && st.status !== 'done' && (
-                      <span className="text-blue-400 shrink-0" title="위임됨">🔗</span>
+                      <span
+                        className="text-blue-400 shrink-0"
+                        title={t({ ko: '위임됨', en: 'Delegated', ja: '委任済み', zh: '已委派' })}
+                      >
+                        🔗
+                      </span>
                     )}
                     {st.status === 'blocked' && st.blocked_reason && (
                       <span className="text-red-400 text-[10px] truncate max-w-[80px]" title={st.blocked_reason}>
@@ -682,67 +880,105 @@ function TaskCard({
         {canRun && (
           <button
             onClick={() => onRunTask(task.id)}
-            title="Run task"
+            title={t({ ko: '작업 실행', en: 'Run task', ja: 'タスク実行', zh: '运行任务' })}
             className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-green-700 px-2 py-1.5 text-xs font-medium text-white transition hover:bg-green-600"
           >
-            ▶ Run
+            ▶ {t({ ko: '실행', en: 'Run', ja: '実行', zh: '运行' })}
           </button>
         )}
         {canPause && (
           <button
             onClick={() => onPauseTask!(task.id)}
-            title="Pause task (보류)"
+            title={t({ ko: '작업 일시중지', en: 'Pause task', ja: 'タスク一時停止', zh: '暂停任务' })}
             className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-orange-700 px-2 py-1.5 text-xs font-medium text-white transition hover:bg-orange-600"
           >
-            ⏸ Pause
+            ⏸ {t({ ko: '일시중지', en: 'Pause', ja: '一時停止', zh: '暂停' })}
           </button>
         )}
         {canStop && (
           <button
             onClick={() => {
-              if (confirm(`"${task.title}" 작업을 중지할까요?\n\n경고: Stop 처리 시 해당 프로젝트 변경분은 롤백됩니다.`)) {
+              if (
+                confirm(
+                  t({
+                    ko: `"${task.title}" 작업을 중지할까요?\n\n경고: Stop 처리 시 해당 프로젝트 변경분은 롤백됩니다.`,
+                    en: `Stop "${task.title}"?\n\nWarning: stopping will roll back project changes.`,
+                    ja: `「${task.title}」を停止しますか？\n\n警告: 停止するとプロジェクトの変更はロールバックされます。`,
+                    zh: `要停止“${task.title}”吗？\n\n警告：停止后将回滚该项目的更改。`,
+                  }),
+                )
+              ) {
                 onStopTask(task.id);
               }
             }}
-            title="Cancel task (취소)"
+            title={t({ ko: '작업 중지', en: 'Cancel task', ja: 'タスク停止', zh: '取消任务' })}
             className="flex items-center justify-center gap-1 rounded-lg bg-red-800 px-2 py-1.5 text-xs font-medium text-white transition hover:bg-red-700"
           >
-            ⏹ Cancel
+            ⏹ {t({ ko: '중지', en: 'Cancel', ja: 'キャンセル', zh: '取消' })}
           </button>
         )}
         {canResume && (
           <button
             onClick={() => onResumeTask!(task.id)}
-            title="Resume task (복구)"
+            title={t({ ko: '작업 재개', en: 'Resume task', ja: 'タスク再開', zh: '恢复任务' })}
             className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-blue-700 px-2 py-1.5 text-xs font-medium text-white transition hover:bg-blue-600"
           >
-            ↩ Resume
+            ↩ {t({ ko: '재개', en: 'Resume', ja: '再開', zh: '恢复' })}
           </button>
         )}
         {(task.status === 'in_progress' || task.status === 'review' || task.status === 'done' || task.status === 'pending') && onOpenTerminal && (
           <button
             onClick={() => onOpenTerminal(task.id)}
-            title="View terminal output"
+            title={t({
+              ko: '터미널 출력 보기',
+              en: 'View terminal output',
+              ja: 'ターミナル出力を見る',
+              zh: '查看终端输出',
+            })}
             className="flex items-center justify-center rounded-lg bg-slate-700 px-2 py-1.5 text-xs text-slate-300 transition hover:bg-slate-600 hover:text-white"
           >
             &#128421;
           </button>
         )}
+        {(task.status === 'planned' || task.status === 'in_progress' || task.status === 'review' || task.status === 'done' || task.status === 'pending') && onOpenMeetingMinutes && (
+          <button
+            onClick={() => onOpenMeetingMinutes(task.id)}
+            title={t({
+              ko: '회의록 보기',
+              en: 'View meeting minutes',
+              ja: '会議録を見る',
+              zh: '查看会议纪要',
+            })}
+            className="flex items-center justify-center rounded-lg bg-cyan-800/70 px-2 py-1.5 text-xs text-cyan-200 transition hover:bg-cyan-700 hover:text-white"
+          >
+            📝
+          </button>
+        )}
         {task.status === 'review' && (
           <button
             onClick={() => setShowDiff(true)}
-            title="View changes (Git diff)"
+            title={t({ ko: '변경사항 보기 (Git diff)', en: 'View changes (Git diff)', ja: '変更を見る (Git diff)', zh: '查看更改 (Git diff)' })}
             className="flex items-center justify-center gap-1 rounded-lg bg-purple-800 px-2 py-1.5 text-xs font-medium text-purple-200 transition hover:bg-purple-700"
           >
-            Diff
+            {t({ ko: 'Diff', en: 'Diff', ja: '差分', zh: '差异' })}
           </button>
         )}
         {canDelete && (
           <button
             onClick={() => {
-              if (confirm(`"${task.title}" 업무를 삭제할까요?`)) onDeleteTask(task.id);
+              if (
+                confirm(
+                  t({
+                    ko: `"${task.title}" 업무를 삭제할까요?`,
+                    en: `Delete "${task.title}"?`,
+                    ja: `「${task.title}」を削除しますか？`,
+                    zh: `要删除“${task.title}”吗？`,
+                  }),
+                )
+              )
+                onDeleteTask(task.id);
             }}
-            title="Delete task"
+            title={t({ ko: '작업 삭제', en: 'Delete task', ja: 'タスク削除', zh: '删除任务' })}
             className="flex items-center justify-center rounded-lg bg-red-900/60 px-2 py-1.5 text-xs text-red-400 transition hover:bg-red-800 hover:text-red-300"
           >
             🗑
@@ -783,6 +1019,8 @@ function FilterBar({
   onFilterType,
   onSearch,
 }: FilterBarProps) {
+  const { t, locale } = useI18n();
+
   return (
     <div className="flex flex-wrap items-center gap-2">
       {/* Search */}
@@ -792,7 +1030,7 @@ function FilterBar({
           type="text"
           value={search}
           onChange={(e) => onSearch(e.target.value)}
-          placeholder="업무 검색..."
+          placeholder={t({ ko: '업무 검색...', en: 'Search tasks...', ja: 'タスク検索...', zh: '搜索任务...' })}
           className="w-full rounded-lg border border-slate-700 bg-slate-800 py-1.5 pl-8 pr-3 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
         />
       </div>
@@ -803,10 +1041,10 @@ function FilterBar({
         onChange={(e) => onFilterDept(e.target.value)}
         className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-slate-300 outline-none transition focus:border-blue-500"
       >
-        <option value="">전체 부서</option>
+        <option value="">{t({ ko: '전체 부서', en: 'All Departments', ja: '全部署', zh: '全部门' })}</option>
         {departments.map((d) => (
           <option key={d.id} value={d.id}>
-            {d.icon} {d.name_ko}
+            {d.icon} {locale === 'ko' ? d.name_ko : d.name}
           </option>
         ))}
       </select>
@@ -816,7 +1054,7 @@ function FilterBar({
         agents={agents}
         value={filterAgent}
         onChange={onFilterAgent}
-        placeholder="전체 에이전트"
+        placeholder={t({ ko: '전체 에이전트', en: 'All Agents', ja: '全エージェント', zh: '全部代理' })}
         size="md"
       />
 
@@ -826,10 +1064,10 @@ function FilterBar({
         onChange={(e) => onFilterType(e.target.value)}
         className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-slate-300 outline-none transition focus:border-blue-500"
       >
-        <option value="">전체 유형</option>
-        {TASK_TYPE_OPTIONS.map((t) => (
-          <option key={t.value} value={t.value}>
-            {t.label}
+        <option value="">{t({ ko: '전체 유형', en: 'All Types', ja: '全タイプ', zh: '全部类型' })}</option>
+        {TASK_TYPE_OPTIONS.map((typeOption) => (
+          <option key={typeOption.value} value={typeOption.value}>
+            {taskTypeLabel(typeOption.value, t)}
           </option>
         ))}
       </select>
@@ -853,9 +1091,11 @@ export function TaskBoard({
   onPauseTask,
   onResumeTask,
   onOpenTerminal,
+  onOpenMeetingMinutes,
   onMergeTask,
   onDiscardTask,
 }: TaskBoardProps) {
+  const { t } = useI18n();
   const [showCreate, setShowCreate] = useState(false);
   const [filterDept, setFilterDept] = useState('');
   const [filterAgent, setFilterAgent] = useState('');
@@ -897,10 +1137,17 @@ export function TaskBoard({
     <div className="flex h-full flex-col gap-4 bg-slate-950 p-4">
       {/* Top bar */}
       <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-xl font-bold text-white">Task Board</h1>
+        <h1 className="text-xl font-bold text-white">{t({ ko: '업무 보드', en: 'Task Board', ja: 'タスクボード', zh: '任务看板' })}</h1>
         <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-xs text-slate-400">
-          총 {filteredTasks.length}개
-          {activeFilterCount > 0 && ` (필터 ${activeFilterCount}개 적용)`}
+          {t({ ko: '총', en: 'Total', ja: '合計', zh: '总计' })} {filteredTasks.length}
+          {t({ ko: '개', en: '', ja: '件', zh: '项' })}
+          {activeFilterCount > 0 &&
+            ` (${t({ ko: '필터', en: 'filters', ja: 'フィルター', zh: '筛选器' })} ${activeFilterCount}${t({
+              ko: '개 적용',
+              en: ' applied',
+              ja: '件適用',
+              zh: '个已应用',
+            })})`}
         </span>
         <div className="ml-auto flex items-center gap-2">
           {activeFilterCount > 0 && (
@@ -913,14 +1160,14 @@ export function TaskBoard({
               }}
               className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
             >
-              필터 초기화
+              {t({ ko: '필터 초기화', en: 'Reset Filters', ja: 'フィルターをリセット', zh: '重置筛选' })}
             </button>
           )}
           <button
             onClick={() => setShowCreate(true)}
             className="rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-semibold text-white shadow transition hover:bg-blue-500 active:scale-95"
           >
-            + 새 업무
+            + {t({ ko: '새 업무', en: 'New Task', ja: '新規タスク', zh: '新建任务' })}
           </button>
         </div>
       </div>
@@ -957,7 +1204,7 @@ export function TaskBoard({
                     className={`h-2 w-2 flex-shrink-0 rounded-full ${col.dotColor}`}
                   />
                   <span className="text-sm font-semibold text-white">
-                    {col.icon} {col.label}
+                    {col.icon} {taskStatusLabel(col.status, t)}
                   </span>
                 </div>
                 <span className="rounded-full bg-black/30 px-2 py-0.5 text-xs font-bold text-white/80">
@@ -969,7 +1216,7 @@ export function TaskBoard({
               <div className="flex flex-1 flex-col gap-2.5 overflow-y-auto p-2.5">
                 {colTasks.length === 0 ? (
                   <div className="flex flex-1 items-center justify-center py-8 text-xs text-slate-600">
-                    업무 없음
+                    {t({ ko: '업무 없음', en: 'No tasks', ja: 'タスクなし', zh: '暂无任务' })}
                   </div>
                 ) : (
                   colTasks.map((task) => (
@@ -987,6 +1234,7 @@ export function TaskBoard({
                       onPauseTask={onPauseTask}
                       onResumeTask={onResumeTask}
                       onOpenTerminal={onOpenTerminal}
+                      onOpenMeetingMinutes={onOpenMeetingMinutes}
                       onMergeTask={onMergeTask}
                       onDiscardTask={onDiscardTask}
                     />

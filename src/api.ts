@@ -2,7 +2,7 @@ import type {
   Department, Agent, Task, TaskLog, Message,
   CliStatusMap, CompanyStats, CompanySettings,
   TaskStatus, TaskType, CliProvider, AgentRole,
-  MessageType, ReceiverType, SubTask,
+  MessageType, ReceiverType, SubTask, MeetingMinute,
   CliModelInfo
 } from './types';
 
@@ -175,6 +175,11 @@ export async function getTerminal(id: string, lines?: number, pretty?: boolean):
   if (pretty) params.set('pretty', '1');
   const q = params.toString();
   return request(`/api/tasks/${id}/terminal${q ? '?' + q : ''}`);
+}
+
+export async function getTaskMeetingMinutes(id: string): Promise<MeetingMinute[]> {
+  const j = await request<{ meetings: MeetingMinute[] }>(`/api/tasks/${id}/meeting-minutes`);
+  return j.meetings;
 }
 
 // CLI Status

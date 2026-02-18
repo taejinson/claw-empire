@@ -13,6 +13,70 @@ interface SettingsPanelProps {
   onOauthResultClear?: () => void;
 }
 
+type Locale = "ko" | "en" | "ja" | "zh";
+type TFunction = (messages: Record<Locale, string>) => string;
+type LocalSettings = Omit<CompanySettings, "language"> & { language: Locale };
+
+const LANGUAGE_STORAGE_KEY = "climpire.language";
+const LOCALE_TAGS: Record<Locale, string> = {
+  ko: "ko-KR",
+  en: "en-US",
+  ja: "ja-JP",
+  zh: "zh-CN",
+};
+
+function normalizeLocale(value: string | null | undefined): Locale | null {
+  const code = (value ?? "").toLowerCase();
+  if (code.startsWith("ko")) return "ko";
+  if (code.startsWith("en")) return "en";
+  if (code.startsWith("ja")) return "ja";
+  if (code.startsWith("zh")) return "zh";
+  return null;
+}
+
+function detectLocale(): Locale {
+  if (typeof window === "undefined") return "en";
+  return (
+    normalizeLocale(window.localStorage.getItem(LANGUAGE_STORAGE_KEY)) ??
+    normalizeLocale(window.navigator.language) ??
+    "en"
+  );
+}
+
+function useI18n(preferredLocale?: string) {
+  const [locale, setLocale] = useState<Locale>(
+    () => normalizeLocale(preferredLocale) ?? detectLocale()
+  );
+
+  useEffect(() => {
+    const preferred = normalizeLocale(preferredLocale);
+    if (preferred) setLocale(preferred);
+  }, [preferredLocale]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sync = () => {
+      setLocale(normalizeLocale(preferredLocale) ?? detectLocale());
+    };
+    window.addEventListener("storage", sync);
+    window.addEventListener("climpire-language-change", sync as EventListener);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener(
+        "climpire-language-change",
+        sync as EventListener
+      );
+    };
+  }, [preferredLocale]);
+
+  const t = useCallback(
+    (messages: Record<Locale, string>) => messages[locale] ?? messages.en,
+    [locale]
+  );
+
+  return { locale, localeTag: LOCALE_TAGS[locale], t };
+}
+
 // SVG logos matching OfficeView CLI Usage icons
 function CliClaudeLogo() {
   return (
@@ -78,7 +142,7 @@ function AntigravityLogo({ className }: { className?: string }) {
 const CONNECTABLE_PROVIDERS: Array<{
   id: OAuthConnectProvider;
   label: string;
-  Logo: ({ className }: { className?: string }) => JSX.Element;
+  Logo: ({ className }: { className?: string }) => React.ReactElement;
   description: string;
 }> = [
   { id: "github-copilot", label: "GitHub Copilot", Logo: GitHubCopilotLogo, description: "GitHub OAuth (Copilot)" },
@@ -93,7 +157,8 @@ export default function SettingsPanel({
   oauthResult,
   onOauthResultClear,
 }: SettingsPanelProps) {
-  const [form, setForm] = useState<CompanySettings>(settings);
+  const [form, setForm] = useState<LocalSettings>(settings as LocalSettings);
+  const { t, localeTag } = useI18n(form.language);
   const [saved, setSaved] = useState(false);
   const [tab, setTab] = useState<"general" | "cli" | "oauth">(
     oauthResult ? "oauth" : "general"
@@ -116,8 +181,18 @@ export default function SettingsPanel({
   const [deviceError, setDeviceError] = useState<string | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const persistSettings = useCallback(
+    (next: LocalSettings) => {
+      onSave(next as unknown as CompanySettings);
+    },
+    [onSave]
+  );
+
   useEffect(() => {
-    setForm(settings);
+    setForm(settings as LocalSettings);
+    const syncedLocale = normalizeLocale((settings as LocalSettings).language) ?? "en";
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, syncedLocale);
+    window.dispatchEvent(new Event("climpire-language-change"));
   }, [settings]);
 
   // Auto-switch to oauth tab when callback result arrives
@@ -176,7 +251,10 @@ export default function SettingsPanel({
   }, []);
 
   function handleSave() {
-    onSave(form);
+    const nextLocale = normalizeLocale(form.language) ?? "en";
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, nextLocale);
+    window.dispatchEvent(new Event("climpire-language-change"));
+    persistSettings(form);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }
@@ -207,7 +285,14 @@ export default function SettingsPanel({
           pollTimerRef.current = null;
           setDeviceStatus("expired");
           setDeviceCode(null);
-          setDeviceError("코드가 만료되었습니다. 다시 시도하세요.");
+          setDeviceError(
+            t({
+              ko: "코드가 만료되었습니다. 다시 시도하세요.",
+              en: "Code expired. Please try again.",
+              ja: "コードの有効期限が切れました。再試行してください。",
+              zh: "代码已过期，请重试。",
+            })
+          );
           return;
         }
         try {
@@ -224,12 +309,19 @@ export default function SettingsPanel({
             if (pollTimerRef.current) clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
             setDeviceStatus(result.status);
-            setDeviceError(result.status === "expired" ? "코드가 만료되었습니다" : "인증이 거부되었습니다");
+            setDeviceError(
+              result.status === "expired"
+                ? t({ ko: "코드가 만료되었습니다", en: "Code expired", ja: "コードの期限切れ", zh: "代码已过期" })
+                : t({ ko: "인증이 거부되었습니다", en: "Authentication denied", ja: "認証が拒否されました", zh: "认证被拒绝" })
+            );
           } else if (result.status === "error") {
             if (pollTimerRef.current) clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
             setDeviceStatus("error");
-            setDeviceError(result.error || "알 수 없는 오류");
+            setDeviceError(
+              result.error ||
+                t({ ko: "알 수 없는 오류", en: "Unknown error", ja: "不明なエラー", zh: "未知错误" })
+            );
           }
           // "pending" and "slow_down" → keep polling
         } catch {
@@ -240,7 +332,7 @@ export default function SettingsPanel({
       setDeviceError(err instanceof Error ? err.message : String(err));
       setDeviceStatus("error");
     }
-  }, []);
+  }, [t]);
 
   async function handleDisconnect(provider: OAuthConnectProvider) {
     setDisconnecting(provider);
@@ -264,15 +356,27 @@ export default function SettingsPanel({
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <h2 className="text-xl font-bold text-white flex items-center gap-2">
-        ⚙️ 설정
+        ⚙️ {t({ ko: "설정", en: "Settings", ja: "設定", zh: "设置" })}
       </h2>
 
       {/* Tab navigation */}
       <div className="flex border-b border-slate-700/50">
         {[
-          { key: "general", label: "일반 설정", icon: "⚙️" },
-          { key: "cli", label: "CLI 도구", icon: "🔧" },
-          { key: "oauth", label: "OAuth 인증", icon: "🔑" },
+          {
+            key: "general",
+            label: t({ ko: "일반 설정", en: "General", ja: "一般設定", zh: "常规设置" }),
+            icon: "⚙️",
+          },
+          {
+            key: "cli",
+            label: t({ ko: "CLI 도구", en: "CLI Tools", ja: "CLI ツール", zh: "CLI 工具" }),
+            icon: "🔧",
+          },
+          {
+            key: "oauth",
+            label: t({ ko: "OAuth 인증", en: "OAuth", ja: "OAuth 認証", zh: "OAuth 认证" }),
+            icon: "🔑",
+          },
         ].map((t) => (
           <button
             key={t.key}
@@ -294,11 +398,13 @@ export default function SettingsPanel({
       <>
       <section className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-5 space-y-4">
         <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
-          회사 정보
+          {t({ ko: "회사 정보", en: "Company", ja: "会社情報", zh: "公司信息" })}
         </h3>
 
         <div>
-          <label className="block text-xs text-slate-400 mb-1">회사명</label>
+          <label className="block text-xs text-slate-400 mb-1">
+            {t({ ko: "회사명", en: "Company Name", ja: "会社名", zh: "公司名称" })}
+          </label>
           <input
             type="text"
             value={form.companyName}
@@ -310,7 +416,9 @@ export default function SettingsPanel({
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 mb-1">CEO 이름</label>
+          <label className="block text-xs text-slate-400 mb-1">
+            {t({ ko: "CEO 이름", en: "CEO Name", ja: "CEO 名", zh: "CEO 名称" })}
+          </label>
           <input
             type="text"
             value={form.ceoName}
@@ -322,7 +430,9 @@ export default function SettingsPanel({
         </div>
 
         <div className="flex items-center gap-3">
-          <label className="text-sm text-slate-300">자동 배정</label>
+          <label className="text-sm text-slate-300">
+            {t({ ko: "자동 배정", en: "Auto Assign", ja: "自動割り当て", zh: "自动分配" })}
+          </label>
           <button
             onClick={() =>
               setForm({ ...form, autoAssign: !form.autoAssign })
@@ -341,7 +451,7 @@ export default function SettingsPanel({
 
         <div>
           <label className="block text-xs text-slate-400 mb-1">
-            기본 CLI 프로바이더
+            {t({ ko: "기본 CLI 프로바이더", en: "Default CLI Provider", ja: "デフォルト CLI プロバイダ", zh: "默认 CLI 提供方" })}
           </label>
           <select
             value={form.defaultProvider}
@@ -361,19 +471,23 @@ export default function SettingsPanel({
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 mb-1">언어</label>
+          <label className="block text-xs text-slate-400 mb-1">
+            {t({ ko: "언어", en: "Language", ja: "言語", zh: "语言" })}
+          </label>
           <select
             value={form.language}
             onChange={(e) =>
               setForm({
                 ...form,
-                language: e.target.value as "ko" | "en",
+                language: e.target.value as Locale,
               })
             }
             className="w-full px-3 py-2 bg-slate-700/50 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
           >
-            <option value="ko">한국어</option>
-            <option value="en">English</option>
+            <option value="ko">{t({ ko: "한국어", en: "Korean", ja: "韓国語", zh: "韩语" })}</option>
+            <option value="en">{t({ ko: "영어", en: "English", ja: "英語", zh: "英语" })}</option>
+            <option value="ja">{t({ ko: "일본어", en: "Japanese", ja: "日本語", zh: "日语" })}</option>
+            <option value="zh">{t({ ko: "중국어", en: "Chinese", ja: "中国語", zh: "中文" })}</option>
           </select>
         </div>
       </section>
@@ -382,14 +496,14 @@ export default function SettingsPanel({
       <div className="flex justify-end gap-3">
         {saved && (
           <span className="text-green-400 text-sm self-center">
-            ✅ 저장 완료
+            ✅ {t({ ko: "저장 완료", en: "Saved", ja: "保存完了", zh: "已保存" })}
           </span>
         )}
         <button
           onClick={handleSave}
           className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors"
         >
-          저장
+          {t({ ko: "저장", en: "Save", ja: "保存", zh: "保存" })}
         </button>
       </div>
       </>
@@ -400,13 +514,13 @@ export default function SettingsPanel({
       <section className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
-            CLI 도구 상태
+            {t({ ko: "CLI 도구 상태", en: "CLI Tool Status", ja: "CLI ツール状態", zh: "CLI 工具状态" })}
           </h3>
           <button
             onClick={onRefreshCli}
             className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
           >
-            🔄 새로고침
+            🔄 {t({ ko: "새로고침", en: "Refresh", ja: "更新", zh: "刷新" })}
           </button>
         </div>
 
@@ -440,7 +554,7 @@ export default function SettingsPanel({
                         {info?.label ?? provider}
                       </div>
                       <div className="text-xs text-slate-500">
-                        {status.version ?? "미설치"}
+                        {status.version ?? t({ ko: "미설치", en: "Not installed", ja: "未インストール", zh: "未安装" })}
                       </div>
                     </div>
                     <div className="flex gap-2">
@@ -451,7 +565,9 @@ export default function SettingsPanel({
                             : "bg-slate-600/50 text-slate-400"
                         }`}
                       >
-                        {status.installed ? "설치됨" : "미설치"}
+                        {status.installed
+                          ? t({ ko: "설치됨", en: "Installed", ja: "インストール済み", zh: "已安装" })
+                          : t({ ko: "미설치", en: "Not installed", ja: "未インストール", zh: "未安装" })}
                       </span>
                       {status.installed && (
                         <span
@@ -461,7 +577,9 @@ export default function SettingsPanel({
                               : "bg-yellow-500/20 text-yellow-400"
                           }`}
                         >
-                          {status.authenticated ? "인증됨" : "미인증"}
+                          {status.authenticated
+                            ? t({ ko: "인증됨", en: "Authenticated", ja: "認証済み", zh: "已认证" })
+                            : t({ ko: "미인증", en: "Not Authenticated", ja: "未認証", zh: "未认证" })}
                         </span>
                       )}
                     </div>
@@ -473,10 +591,14 @@ export default function SettingsPanel({
                       {/* Main model */}
                       <div className="flex items-center gap-2">
                         <span className="text-xs text-slate-400 shrink-0 w-20">
-                          {hasSubModel ? "메인 모델:" : "모델:"}
+                          {hasSubModel
+                            ? t({ ko: "메인 모델:", en: "Main model:", ja: "メインモデル:", zh: "主模型:" })
+                            : t({ ko: "모델:", en: "Model:", ja: "モデル:", zh: "模型:" })}
                         </span>
                         {cliModelsLoading ? (
-                          <span className="text-xs text-slate-500 animate-pulse">로딩 중...</span>
+                          <span className="text-xs text-slate-500 animate-pulse">
+                            {t({ ko: "로딩 중...", en: "Loading...", ja: "読み込み中...", zh: "加载中..." })}
+                          </span>
                         ) : modelList.length > 0 ? (
                           <select
                             value={currentModel}
@@ -494,11 +616,11 @@ export default function SettingsPanel({
                               };
                               const newForm = { ...form, providerModelConfig: newConfig };
                               setForm(newForm);
-                              onSave(newForm);
+                              persistSettings(newForm);
                             }}
                             className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
                           >
-                            <option value="">기본값</option>
+                            <option value="">{t({ ko: "기본값", en: "Default", ja: "デフォルト", zh: "默认" })}</option>
                             {modelList.map((m) => (
                               <option key={m.slug} value={m.slug}>
                                 {m.displayName || m.slug}
@@ -506,14 +628,18 @@ export default function SettingsPanel({
                             ))}
                           </select>
                         ) : (
-                          <span className="text-xs text-slate-500">모델 목록 없음</span>
+                          <span className="text-xs text-slate-500">
+                            {t({ ko: "모델 목록 없음", en: "No models", ja: "モデル一覧なし", zh: "无模型列表" })}
+                          </span>
                         )}
                       </div>
 
                       {/* Reasoning level dropdown — Codex only */}
                       {provider === "codex" && reasoningLevels && reasoningLevels.length > 0 && (
                         <div className="flex items-center gap-2">
-                          <span className="text-xs text-slate-400 shrink-0 w-20">추론 레벨:</span>
+                          <span className="text-xs text-slate-400 shrink-0 w-20">
+                            {t({ ko: "추론 레벨:", en: "Reasoning:", ja: "推論レベル:", zh: "推理级别:" })}
+                          </span>
                           <select
                             value={currentReasoningLevel || defaultReasoning}
                             onChange={(e) => {
@@ -524,7 +650,7 @@ export default function SettingsPanel({
                               };
                               const newForm = { ...form, providerModelConfig: newConfig };
                               setForm(newForm);
-                              onSave(newForm);
+                              persistSettings(newForm);
                             }}
                             className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
                           >
@@ -541,9 +667,13 @@ export default function SettingsPanel({
                       {hasSubModel && (
                         <>
                           <div className="flex items-center gap-2">
-                            <span className="text-xs text-slate-400 shrink-0 w-20">알바생 모델:</span>
+                            <span className="text-xs text-slate-400 shrink-0 w-20">
+                              {t({ ko: "알바생 모델:", en: "Sub-agent model:", ja: "サブモデル:", zh: "子代理模型:" })}
+                            </span>
                             {cliModelsLoading ? (
-                              <span className="text-xs text-slate-500 animate-pulse">로딩 중...</span>
+                              <span className="text-xs text-slate-500 animate-pulse">
+                                {t({ ko: "로딩 중...", en: "Loading...", ja: "読み込み中...", zh: "加载中..." })}
+                              </span>
                             ) : modelList.length > 0 ? (
                               <select
                                 value={currentSubModel}
@@ -561,11 +691,11 @@ export default function SettingsPanel({
                                   };
                                   const newForm = { ...form, providerModelConfig: newConfig };
                                   setForm(newForm);
-                                  onSave(newForm);
+                                  persistSettings(newForm);
                                 }}
                                 className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
                               >
-                                <option value="">기본값</option>
+                                <option value="">{t({ ko: "기본값", en: "Default", ja: "デフォルト", zh: "默认" })}</option>
                                 {modelList.map((m) => (
                                   <option key={m.slug} value={m.slug}>
                                     {m.displayName || m.slug}
@@ -573,7 +703,9 @@ export default function SettingsPanel({
                                 ))}
                               </select>
                             ) : (
-                              <span className="text-xs text-slate-500">모델 목록 없음</span>
+                              <span className="text-xs text-slate-500">
+                                {t({ ko: "모델 목록 없음", en: "No models", ja: "モデル一覧なし", zh: "无模型列表" })}
+                              </span>
                             )}
                           </div>
 
@@ -586,7 +718,9 @@ export default function SettingsPanel({
                             if (provider !== "codex" || !subLevels || subLevels.length === 0) return null;
                             return (
                               <div className="flex items-center gap-2">
-                                <span className="text-xs text-slate-400 shrink-0 w-20">알바 추론:</span>
+                                <span className="text-xs text-slate-400 shrink-0 w-20">
+                                  {t({ ko: "알바 추론:", en: "Sub reasoning:", ja: "サブ推論:", zh: "子推理:" })}
+                                </span>
                                 <select
                                   value={currentSubRL || subDefault}
                                   onChange={(e) => {
@@ -597,7 +731,7 @@ export default function SettingsPanel({
                                     };
                                     const newForm = { ...form, providerModelConfig: newConfig };
                                     setForm(newForm);
-                                    onSave(newForm);
+                                    persistSettings(newForm);
                                   }}
                                   className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
                                 >
@@ -620,13 +754,17 @@ export default function SettingsPanel({
           </div>
         ) : (
           <div className="text-center py-4 text-slate-500 text-sm">
-            로딩 중...
+            {t({ ko: "로딩 중...", en: "Loading...", ja: "読み込み中...", zh: "加载中..." })}
           </div>
         )}
 
         <p className="text-xs text-slate-500">
-          각 에이전트의 CLI 도구는 오피스에서 에이전트 클릭 후 변경할 수 있습니다.
-          Copilot/Antigravity 모델은 OAuth 탭에서 설정합니다.
+          {t({
+            ko: "각 에이전트의 CLI 도구는 오피스에서 에이전트 클릭 후 변경할 수 있습니다. Copilot/Antigravity 모델은 OAuth 탭에서 설정합니다.",
+            en: "Each agent's CLI tool can be changed in Office by clicking an agent. Configure Copilot/Antigravity models in OAuth tab.",
+            ja: "各エージェントの CLI ツールは Office でエージェントをクリックして変更できます。Copilot/Antigravity のモデルは OAuth タブで設定してください。",
+            zh: "每个代理的 CLI 工具可在 Office 中点击代理后修改。Copilot/Antigravity 模型请在 OAuth 页签配置。",
+          })}
         </p>
       </section>
       )}
@@ -636,7 +774,7 @@ export default function SettingsPanel({
       <section className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
-            OAuth 인증 현황
+            {t({ ko: "OAuth 인증 현황", en: "OAuth Status", ja: "OAuth 認証状態", zh: "OAuth 认证状态" })}
           </h3>
           <button
             onClick={() => {
@@ -649,7 +787,7 @@ export default function SettingsPanel({
             }}
             className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
           >
-            🔄 새로고침
+            🔄 {t({ ko: "새로고침", en: "Refresh", ja: "更新", zh: "刷新" })}
           </button>
         </div>
 
@@ -662,8 +800,8 @@ export default function SettingsPanel({
           }`}>
             <span>
               {oauthResult.error
-                ? `OAuth 연결 실패: ${oauthResult.error}`
-                : `${OAUTH_INFO[oauthResult.provider || ""]?.label || oauthResult.provider} 연결 완료!`}
+                ? `${t({ ko: "OAuth 연결 실패", en: "OAuth connection failed", ja: "OAuth 接続失敗", zh: "OAuth 连接失败" })}: ${oauthResult.error}`
+                : `${OAUTH_INFO[oauthResult.provider || ""]?.label || oauthResult.provider} ${t({ ko: "연결 완료!", en: "connected!", ja: "接続完了!", zh: "连接成功!" })}`}
             </span>
             <button
               onClick={() => onOauthResultClear?.()}
@@ -684,15 +822,25 @@ export default function SettingsPanel({
             <span>{oauthStatus.storageReady ? "🔒" : "⚠️"}</span>
             <span>
               {oauthStatus.storageReady
-                ? "OAuth 저장소 활성화됨 (암호화 키 설정됨)"
-                : "OAUTH_ENCRYPTION_SECRET 환경변수가 설정되지 않았습니다"}
+                ? t({
+                    ko: "OAuth 저장소 활성화됨 (암호화 키 설정됨)",
+                    en: "OAuth storage is active (encryption key configured)",
+                    ja: "OAuth ストレージ有効（暗号化キー設定済み）",
+                    zh: "OAuth 存储已启用（已配置加密密钥）",
+                  })
+                : t({
+                    ko: "OAUTH_ENCRYPTION_SECRET 환경변수가 설정되지 않았습니다",
+                    en: "OAUTH_ENCRYPTION_SECRET environment variable is not set",
+                    ja: "OAUTH_ENCRYPTION_SECRET 環境変数が設定されていません",
+                    zh: "未设置 OAUTH_ENCRYPTION_SECRET 环境变量",
+                  })}
             </span>
           </div>
         )}
 
         {oauthLoading ? (
           <div className="text-center py-8 text-slate-500 text-sm">
-            로딩 중...
+            {t({ ko: "로딩 중...", en: "Loading...", ja: "読み込み中...", zh: "加载中..." })}
           </div>
         ) : oauthStatus ? (
           <>
@@ -700,13 +848,13 @@ export default function SettingsPanel({
             {(() => {
               const connected = Object.entries(oauthStatus.providers).filter(([, info]) => info.connected);
               if (connected.length === 0) return null;
-              const logoMap: Record<string, ({ className }: { className?: string }) => JSX.Element> = {
+              const logoMap: Record<string, ({ className }: { className?: string }) => React.ReactElement> = {
                 "github-copilot": GitHubCopilotLogo, antigravity: AntigravityLogo,
               };
               return (
                 <div className="space-y-2">
                   <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-                    연결된 서비스
+                    {t({ ko: "연결된 서비스", en: "Connected Services", ja: "接続済みサービス", zh: "已连接服务" })}
                   </div>
                   {connected.map(([provider, info]) => {
                     const oauthInfo = OAUTH_INFO[provider];
@@ -728,12 +876,12 @@ export default function SettingsPanel({
                             )}
                             {isFileDetected && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/50 text-slate-400">
-                                CLI 감지
+                                {t({ ko: "CLI 감지", en: "CLI detected", ja: "CLI 検出", zh: "检测到 CLI" })}
                               </span>
                             )}
                             {isWebOAuth && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
-                                웹 OAuth
+                                {t({ ko: "웹 OAuth", en: "Web OAuth", ja: "Web OAuth", zh: "网页 OAuth" })}
                               </span>
                             )}
                           </div>
@@ -743,7 +891,9 @@ export default function SettingsPanel({
                                 ? "bg-green-500/20 text-green-400"
                                 : "bg-red-500/20 text-red-400"
                             }`}>
-                              {!isExpired ? "연결됨" : "만료됨"}
+                              {!isExpired
+                                ? t({ ko: "연결됨", en: "Connected", ja: "接続中", zh: "已连接" })
+                                : t({ ko: "만료됨", en: "Expired", ja: "期限切れ", zh: "已过期" })}
                             </span>
                             {isWebOAuth && (
                               <button
@@ -751,7 +901,9 @@ export default function SettingsPanel({
                                 disabled={disconnecting === provider}
                                 className="text-xs px-2.5 py-1 rounded-lg bg-red-600/20 hover:bg-red-600/30 text-red-400 border border-red-500/30 transition-colors disabled:opacity-50"
                               >
-                                {disconnecting === provider ? "해제 중..." : "연결 해제"}
+                                {disconnecting === provider
+                                  ? t({ ko: "해제 중...", en: "Disconnecting...", ja: "切断中...", zh: "断开中..." })
+                                  : t({ ko: "연결 해제", en: "Disconnect", ja: "接続解除", zh: "断开连接" })}
                               </button>
                             )}
                           </div>
@@ -760,23 +912,29 @@ export default function SettingsPanel({
                           <div className="grid grid-cols-2 gap-2 text-xs">
                             {info.scope && (
                               <div className="col-span-2">
-                                <span className="text-slate-500">스코프: </span>
+                                <span className="text-slate-500">
+                                  {t({ ko: "스코프", en: "Scope", ja: "スコープ", zh: "范围" })}:{" "}
+                                </span>
                                 <span className="text-slate-300 font-mono text-[10px]">{info.scope}</span>
                               </div>
                             )}
                             {expiresAt && (
                               <div>
-                                <span className="text-slate-500">만료: </span>
+                                <span className="text-slate-500">
+                                  {t({ ko: "만료", en: "Expires", ja: "期限", zh: "到期" })}:{" "}
+                                </span>
                                 <span className={isExpired ? "text-red-400" : "text-slate-300"}>
-                                  {expiresAt.toLocaleString("ko-KR")}
+                                  {expiresAt.toLocaleString(localeTag)}
                                 </span>
                               </div>
                             )}
                             {info.created_at > 0 && (
                               <div>
-                                <span className="text-slate-500">등록: </span>
+                                <span className="text-slate-500">
+                                  {t({ ko: "등록", en: "Created", ja: "登録", zh: "创建" })}:{" "}
+                                </span>
                                 <span className="text-slate-300">
-                                  {new Date(info.created_at).toLocaleString("ko-KR")}
+                                  {new Date(info.created_at).toLocaleString(localeTag)}
                                 </span>
                               </div>
                             )}
@@ -790,9 +948,13 @@ export default function SettingsPanel({
                           const currentModel = form.providerModelConfig?.[modelKey]?.model || "";
                           return (
                             <div className="flex items-center gap-2 pt-1">
-                              <span className="text-xs text-slate-400 shrink-0">모델:</span>
+                              <span className="text-xs text-slate-400 shrink-0">
+                                {t({ ko: "모델:", en: "Model:", ja: "モデル:", zh: "模型:" })}
+                              </span>
                               {modelsLoading ? (
-                                <span className="text-xs text-slate-500 animate-pulse">로딩 중...</span>
+                                <span className="text-xs text-slate-500 animate-pulse">
+                                  {t({ ko: "로딩 중...", en: "Loading...", ja: "読み込み中...", zh: "加载中..." })}
+                                </span>
                               ) : modelList && modelList.length > 0 ? (
                                 <select
                                   value={currentModel}
@@ -800,17 +962,23 @@ export default function SettingsPanel({
                                     const newConfig = { ...form.providerModelConfig, [modelKey]: { model: e.target.value } };
                                     const newForm = { ...form, providerModelConfig: newConfig };
                                     setForm(newForm);
-                                    onSave(newForm);
+                                    persistSettings(newForm);
                                   }}
                                   className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
                                 >
-                                  {!currentModel && <option value="">선택하세요...</option>}
+                                  {!currentModel && (
+                                    <option value="">
+                                      {t({ ko: "선택하세요...", en: "Select...", ja: "選択してください...", zh: "请选择..." })}
+                                    </option>
+                                  )}
                                   {modelList.map((m) => (
                                     <option key={m} value={m}>{m}</option>
                                   ))}
                                 </select>
                               ) : (
-                                <span className="text-xs text-slate-500">모델 목록 없음</span>
+                                <span className="text-xs text-slate-500">
+                                  {t({ ko: "모델 목록 없음", en: "No models", ja: "モデル一覧なし", zh: "无模型列表" })}
+                                </span>
                               )}
                             </div>
                           );
@@ -825,7 +993,7 @@ export default function SettingsPanel({
             {/* New OAuth Connect section — provider cards */}
             <div className="space-y-3">
               <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                새 OAuth 연결
+                {t({ ko: "새 OAuth 연결", en: "New OAuth Connection", ja: "新しい OAuth 接続", zh: "新 OAuth 连接" })}
               </div>
               <div className="grid grid-cols-2 gap-3">
                 {CONNECTABLE_PROVIDERS.map(({ id, label, Logo, description }) => {
@@ -850,11 +1018,11 @@ export default function SettingsPanel({
                       <span className="text-[10px] text-slate-400 text-center leading-tight">{description}</span>
                       {isConnected ? (
                         <span className="text-[11px] px-2.5 py-1 rounded-lg bg-green-500/20 text-green-400 font-medium">
-                          연결됨
+                          {t({ ko: "연결됨", en: "Connected", ja: "接続済み", zh: "已连接" })}
                         </span>
                       ) : !storageOk ? (
                         <span className="text-[10px] px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
-                          암호화 키 필요
+                          {t({ ko: "암호화 키 필요", en: "Encryption key required", ja: "暗号化キーが必要", zh: "需要加密密钥" })}
                         </span>
                       ) : isGitHub ? (
                         /* GitHub Copilot: Device Code flow */
@@ -864,7 +1032,7 @@ export default function SettingsPanel({
                               {deviceCode.userCode}
                             </div>
                             <span className="text-[10px] text-blue-400 animate-pulse">
-                              코드 입력 대기 중...
+                              {t({ ko: "코드 입력 대기 중...", en: "Waiting for code...", ja: "コード入力待機中...", zh: "等待输入代码..." })}
                             </span>
                           </div>
                         ) : (
@@ -872,7 +1040,7 @@ export default function SettingsPanel({
                             onClick={startDeviceCodeFlow}
                             className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
                           >
-                            연결하기
+                            {t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
                           </button>
                         )
                       ) : (
@@ -881,7 +1049,7 @@ export default function SettingsPanel({
                           onClick={() => handleConnect(id)}
                           className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
                         >
-                          연결하기
+                          {t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
                         </button>
                       )}
                     </div>
@@ -891,7 +1059,7 @@ export default function SettingsPanel({
               {/* Device Code flow status messages */}
               {deviceStatus === "complete" && (
                 <div className="text-xs text-green-400 bg-green-500/10 border border-green-500/20 px-3 py-2 rounded-lg">
-                  GitHub Copilot 연결 완료!
+                  {t({ ko: "GitHub Copilot 연결 완료!", en: "GitHub Copilot connected!", ja: "GitHub Copilot 接続完了!", zh: "GitHub Copilot 已连接!" })}
                 </div>
               )}
               {deviceError && (

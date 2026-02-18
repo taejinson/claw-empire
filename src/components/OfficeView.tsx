@@ -14,6 +14,7 @@ import {
 import type { Department, Agent, Task } from "../types";
 import type { CliStatusMap } from "../types";
 import { getCliStatus, getCliUsage, refreshCliUsage, type CliUsageEntry, type CliUsageWindow } from "../api";
+import { useI18n, type UiLanguage } from "../i18n";
 
 /* ================================================================== */
 /*  Types                                                              */
@@ -37,6 +38,8 @@ interface CeoOfficeCall {
   fromAgentId: string;
   seatIndex: number;
   phase: "kickoff" | "review";
+  action?: "arrive" | "speak";
+  line?: string;
 }
 
 interface OfficeViewProps {
@@ -63,6 +66,10 @@ interface Delivery {
   arcHeight?: number;
   speed?: number;
   type?: "throw" | "walk";
+  agentId?: string;
+  holdAtSeat?: boolean;
+  holdUntil?: number;
+  arrived?: boolean;
 }
 
 interface RoomRect {
@@ -103,13 +110,222 @@ const BREAK_THEME = {
   accent: 0xe8a849,
 };
 
-const BREAK_CHAT_MESSAGES = [
-  "커피 한 잔 더~", "오늘 점심 뭐 먹지?", "아 졸려...",
-  "주말에 뭐 해?", "이번 프로젝트 힘들다ㅋ", "카페라떼 최고!",
-  "오늘 날씨 좋다~", "야근 싫어ㅠ", "맛있는 거 먹고 싶다",
-  "조금만 쉬자~", "ㅋㅋㅋㅋ", "간식 왔다!", "5분만 더~",
-  "힘내자 파이팅!", "에너지 충전 중...", "집에 가고 싶다~",
-];
+type SupportedLocale = UiLanguage;
+
+const LOCALE_TEXT = {
+  ceoOffice: {
+    ko: "CEO 오피스",
+    en: "CEO OFFICE",
+    ja: "CEOオフィス",
+    zh: "CEO办公室",
+  },
+  collabTable: {
+    ko: "6인 협업 테이블",
+    en: "6P COLLAB TABLE",
+    ja: "6人コラボテーブル",
+    zh: "6人协作桌",
+  },
+  statsEmployees: { ko: "직원", en: "Staff", ja: "スタッフ", zh: "员工" },
+  statsWorking: { ko: "작업중", en: "Working", ja: "作業中", zh: "处理中" },
+  statsProgress: { ko: "진행", en: "In Progress", ja: "進行", zh: "进行中" },
+  statsDone: { ko: "완료", en: "Done", ja: "完了", zh: "已完成" },
+  hint: {
+    ko: "WASD/방향키: CEO 이동  |  Enter: 상호작용",
+    en: "WASD/Arrow: CEO Move  |  Enter: Interact",
+    ja: "WASD/矢印キー: CEO移動  |  Enter: 操作",
+    zh: "WASD/方向键: CEO移动  |  Enter: 交互",
+  },
+  noAssignedAgent: {
+    ko: "배정된 직원 없음",
+    en: "No assigned staff",
+    ja: "担当スタッフなし",
+    zh: "暂无分配员工",
+  },
+  breakRoom: {
+    ko: "☕ 휴게실",
+    en: "☕ Break Room",
+    ja: "☕ 休憩室",
+    zh: "☕ 休息室",
+  },
+  role: {
+    team_leader: { ko: "팀장", en: "Lead", ja: "リーダー", zh: "组长" },
+    senior: { ko: "시니어", en: "Senior", ja: "シニア", zh: "资深" },
+    junior: { ko: "주니어", en: "Junior", ja: "ジュニア", zh: "初级" },
+    intern: { ko: "인턴", en: "Intern", ja: "インターン", zh: "实习" },
+    part_time: { ko: "알바", en: "Part-time", ja: "アルバイト", zh: "兼职" },
+  },
+  partTime: {
+    ko: "알바",
+    en: "Part-time",
+    ja: "アルバイト",
+    zh: "兼职",
+  },
+  collabBadge: {
+    ko: "🤝 협업",
+    en: "🤝 Collaboration",
+    ja: "🤝 協業",
+    zh: "🤝 协作",
+  },
+  meetingBadgeKickoff: {
+    ko: "📣 회의",
+    en: "📣 Meeting",
+    ja: "📣 会議",
+    zh: "📣 会议",
+  },
+  meetingBadgeReview: {
+    ko: "✅ 승인",
+    en: "✅ Approval",
+    ja: "✅ 承認",
+    zh: "✅ 审批",
+  },
+  kickoffLines: {
+    ko: [
+      "유관부서 영향도 확인중",
+      "리스크/의존성 공유중",
+      "일정/우선순위 조율중",
+      "담당 경계 정의중",
+    ],
+    en: [
+      "Checking cross-team impact",
+      "Sharing risks/dependencies",
+      "Aligning schedule/priorities",
+      "Defining ownership boundaries",
+    ],
+    ja: [
+      "関連部署への影響を確認中",
+      "リスク/依存関係を共有中",
+      "日程/優先度を調整中",
+      "担当境界を定義中",
+    ],
+    zh: [
+      "正在确认跨团队影响",
+      "正在共享风险/依赖关系",
+      "正在协调排期/优先级",
+      "正在定义职责边界",
+    ],
+  },
+  reviewLines: {
+    ko: [
+      "보완사항 반영 확인중",
+      "최종안 Approved 검토중",
+      "수정 아이디어 공유중",
+      "결과물 교차 검토중",
+    ],
+    en: [
+      "Verifying follow-up updates",
+      "Reviewing final approval draft",
+      "Sharing revision ideas",
+      "Cross-checking deliverables",
+    ],
+    ja: [
+      "補完事項の反映を確認中",
+      "最終承認案を確認中",
+      "修正アイデアを共有中",
+      "成果物を相互レビュー中",
+    ],
+    zh: [
+      "正在确认补充项是否反映",
+      "正在审阅最终审批方案",
+      "正在共享修改思路",
+      "正在交叉评审交付物",
+    ],
+  },
+  cliUsageTitle: {
+    ko: "CLI 사용량",
+    en: "CLI Usage",
+    ja: "CLI使用量",
+    zh: "CLI 使用量",
+  },
+  cliConnected: {
+    ko: "연결됨",
+    en: "connected",
+    ja: "接続中",
+    zh: "已连接",
+  },
+  cliRefreshTitle: {
+    ko: "사용량 새로고침",
+    en: "Refresh usage data",
+    ja: "使用量を更新",
+    zh: "刷新用量数据",
+  },
+  cliNotSignedIn: {
+    ko: "로그인되지 않음",
+    en: "not signed in",
+    ja: "未サインイン",
+    zh: "未登录",
+  },
+  cliNoApi: {
+    ko: "사용량 API 없음",
+    en: "no usage API",
+    ja: "使用量APIなし",
+    zh: "无用量 API",
+  },
+  cliUnavailable: {
+    ko: "사용 불가",
+    en: "unavailable",
+    ja: "利用不可",
+    zh: "不可用",
+  },
+  cliLoading: {
+    ko: "불러오는 중...",
+    en: "loading...",
+    ja: "読み込み中...",
+    zh: "加载中...",
+  },
+  cliResets: {
+    ko: "리셋까지",
+    en: "resets",
+    ja: "リセットまで",
+    zh: "重置剩余",
+  },
+  cliNoData: {
+    ko: "데이터 없음",
+    en: "no data",
+    ja: "データなし",
+    zh: "无数据",
+  },
+  soon: {
+    ko: "곧",
+    en: "soon",
+    ja: "まもなく",
+    zh: "即将",
+  },
+};
+
+const BREAK_CHAT_MESSAGES: Record<SupportedLocale, string[]> = {
+  ko: [
+    "커피 한 잔 더~", "오늘 점심 뭐 먹지?", "아 졸려...",
+    "주말에 뭐 해?", "이번 프로젝트 힘들다ㅋ", "카페라떼 최고!",
+    "오늘 날씨 좋다~", "야근 싫어ㅠ", "맛있는 거 먹고 싶다",
+    "조금만 쉬자~", "ㅋㅋㅋㅋ", "간식 왔다!", "5분만 더~",
+    "힘내자 파이팅!", "에너지 충전 중...", "집에 가고 싶다~",
+  ],
+  en: [
+    "One more cup of coffee~", "What should we eat for lunch?", "So sleepy...",
+    "Any weekend plans?", "This project is tough lol", "Cafe latte wins!",
+    "Nice weather today~", "I hate overtime...", "Craving something tasty",
+    "Let's take a short break~", "LOL", "Snacks are here!", "5 more minutes~",
+    "Let's go, fighting!", "Recharging energy...", "I want to go home~",
+  ],
+  ja: [
+    "コーヒーもう一杯~", "今日のランチ何にする?", "眠い...",
+    "週末なにする?", "今回のプロジェクト大変w", "カフェラテ最高!",
+    "今日の天気いいね~", "残業いやだ...", "おいしいもの食べたい",
+    "ちょっと休もう~", "www", "おやつ来た!", "あと5分だけ~",
+    "頑張ろう!", "エネルギー充電中...", "家に帰りたい~",
+  ],
+  zh: [
+    "再来一杯咖啡~", "今天午饭吃什么?", "好困...",
+    "周末准备做什么?", "这个项目有点难哈哈", "拿铁最棒!",
+    "今天天气真好~", "不想加班...", "想吃点好吃的",
+    "先休息一下吧~", "哈哈哈哈", "零食到了!", "再来5分钟~",
+    "加油冲一波!", "正在补充能量...", "想回家了~",
+  ],
+};
+
+function pickLocale<T>(locale: SupportedLocale, map: Record<SupportedLocale, T>): T {
+  return map[locale] ?? map.ko;
+}
 
 // Break spots: positive x = offset from room left; negative x = offset from room right
 // These are calibrated to match furniture positions drawn in buildScene
@@ -328,13 +544,35 @@ function drawVendingMachine(parent: Container, x: number, y: number) {
 /*  Helpers                                                            */
 /* ================================================================== */
 
-function formatReset(iso: string): string {
+function formatReset(iso: string, locale: SupportedLocale): string {
   const diff = new Date(iso).getTime() - Date.now();
-  if (diff <= 0) return "soon";
+  if (diff <= 0) return pickLocale(locale, LOCALE_TEXT.soon);
   const h = Math.floor(diff / 3_600_000);
   const m = Math.floor((diff % 3_600_000) / 60_000);
-  if (h > 0) return `${h}h ${m}m`;
+  if (h > 0) {
+    if (locale === "ko") return `${h}시간 ${m}분`;
+    if (locale === "ja") return `${h}時間 ${m}分`;
+    if (locale === "zh") return `${h}小时 ${m}分`;
+    return `${h}h ${m}m`;
+  }
+  if (locale === "ko") return `${m}분`;
+  if (locale === "ja") return `${m}分`;
+  if (locale === "zh") return `${m}分`;
   return `${m}m`;
+}
+
+function formatPeopleCount(count: number, locale: SupportedLocale): string {
+  if (locale === "ko") return `${count}명`;
+  if (locale === "ja") return `${count}人`;
+  if (locale === "zh") return `${count}人`;
+  return `${count}`;
+}
+
+function formatTaskCount(count: number, locale: SupportedLocale): string {
+  if (locale === "ko") return `${count}건`;
+  if (locale === "ja") return `${count}件`;
+  if (locale === "zh") return `${count}项`;
+  return `${count}`;
 }
 
 /* ================================================================== */
@@ -350,6 +588,7 @@ export default function OfficeView({
   onCeoOfficeCallProcessed,
   onSelectAgent, onSelectDepartment,
 }: OfficeViewProps) {
+  const { language, t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<Application | null>(null);
   const texturesRef = useRef<Record<string, Texture>>({});
@@ -384,6 +623,8 @@ export default function OfficeView({
   }>>([]);
   const breakSteamParticlesRef = useRef<Container | null>(null);
   const breakBubblesRef = useRef<Container[]>([]);
+  const localeRef = useRef<SupportedLocale>(language);
+  localeRef.current = language;
 
   // Latest data via refs (avoids stale closures)
   const dataRef = useRef({ departments, agents, tasks, subAgents, unreadAgentIds });
@@ -406,8 +647,10 @@ export default function OfficeView({
     breakSteamParticlesRef.current = null;
     breakRoomRectRef.current = null;
     ceoMeetingSeatsRef.current = [];
+    deliveriesRef.current = [];
 
     const { departments, agents, tasks, subAgents, unreadAgentIds: unread } = dataRef.current;
+    const activeLocale = localeRef.current;
 
     // Assign unique sprite numbers to each agent (1-12, no duplicates)
     const spriteMap = new Map<string, number>();
@@ -462,7 +705,7 @@ export default function OfficeView({
     ceoLayer.addChild(ceoBorder);
 
     const ceoLabel = new Text({
-      text: "CEO OFFICE",
+      text: pickLocale(activeLocale, LOCALE_TEXT.ceoOffice),
       style: new TextStyle({ fontSize: 10, fill: 0xf5c842, fontWeight: "bold", fontFamily: "monospace", letterSpacing: 2 }),
     });
     ceoLabel.position.set(12, 8);
@@ -487,10 +730,10 @@ export default function OfficeView({
     drawChair(ceoLayer, cdx + 32, cdy + 46, 0xb8860b);
 
     // 6-seat collaboration table in CEO OFFICE
-    const mtX = 220;
-    const mtY = 34;
     const mtW = 220;
     const mtH = 28;
+    const mtX = Math.floor((OFFICE_W - mtW) / 2);
+    const mtY = 48;
     const mt = new Graphics();
     mt.roundRect(mtX, mtY, mtW, mtH, 12).fill(0x6f4f1e);
     mt.roundRect(mtX + 3, mtY + 3, mtW - 6, mtH - 6, 10).fill(0x9d7440);
@@ -504,7 +747,7 @@ export default function OfficeView({
     }
 
     const meetingLabel = new Text({
-      text: "6P COLLAB TABLE",
+      text: pickLocale(activeLocale, LOCALE_TEXT.collabTable),
       style: new TextStyle({ fontSize: 7, fill: 0xf4c862, fontWeight: "bold", fontFamily: "monospace", letterSpacing: 1 }),
     });
     meetingLabel.anchor.set(0.5, 0.5);
@@ -525,10 +768,26 @@ export default function OfficeView({
     const doneCount = tasks.filter(t => t.status === "done").length;
     const inProg = tasks.filter(t => t.status === "in_progress").length;
     const stats = [
-      { icon: "🤖", label: "직원", val: `${agents.length}명` },
-      { icon: "⚡", label: "작업중", val: `${workingCount}명` },
-      { icon: "📋", label: "진행", val: `${inProg}건` },
-      { icon: "✅", label: "완료", val: `${doneCount}/${tasks.length}` },
+      {
+        icon: "🤖",
+        label: pickLocale(activeLocale, LOCALE_TEXT.statsEmployees),
+        val: formatPeopleCount(agents.length, activeLocale),
+      },
+      {
+        icon: "⚡",
+        label: pickLocale(activeLocale, LOCALE_TEXT.statsWorking),
+        val: formatPeopleCount(workingCount, activeLocale),
+      },
+      {
+        icon: "📋",
+        label: pickLocale(activeLocale, LOCALE_TEXT.statsProgress),
+        val: formatTaskCount(inProg, activeLocale),
+      },
+      {
+        icon: "✅",
+        label: pickLocale(activeLocale, LOCALE_TEXT.statsDone),
+        val: `${doneCount}/${tasks.length}`,
+      },
     ];
     stats.forEach((s, i) => {
       const sx = OFFICE_W - 340 + i * 82, sy = 12;
@@ -551,10 +810,17 @@ export default function OfficeView({
 
     // Keyboard hint
     const hint = new Text({
-      text: "WASD/Arrow: CEO Move  |  Enter: Interact",
-      style: new TextStyle({ fontSize: 7, fill: 0x887744, fontFamily: "monospace" }),
+      text: pickLocale(activeLocale, LOCALE_TEXT.hint),
+      style: new TextStyle({
+        fontSize: 10,
+        fontWeight: "bold",
+        fill: 0xd9c48a,
+        fontFamily: "monospace",
+      }),
     });
-    hint.position.set(OFFICE_W - 340, CEO_ZONE_H - 18);
+    hint.anchor.set(1, 1);
+    // Keep the control hint inside the CEO OFFICE area (bottom-right corner).
+    hint.position.set(OFFICE_W - 16, CEO_ZONE_H - 8);
     ceoLayer.addChild(hint);
 
     drawPlant(ceoLayer, 18, 62);
@@ -604,7 +870,7 @@ export default function OfficeView({
       signBg.on("pointerdown", () => cbRef.current.onSelectDepartment(dept));
       room.addChild(signBg);
       const signTxt = new Text({
-        text: `${dept.icon || "🏢"} ${dept.name_ko || dept.name}`,
+        text: `${dept.icon || "🏢"} ${activeLocale === "ko" ? (dept.name_ko || dept.name) : dept.name}`,
         style: new TextStyle({ fontSize: 9, fill: 0xffffff, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
       });
       signTxt.anchor.set(0.5, 0.5);
@@ -620,7 +886,7 @@ export default function OfficeView({
       const deptAgents = agents.filter(a => a.department_id === dept.id);
       if (deptAgents.length === 0) {
         const et = new Text({
-          text: "배정된 직원 없음",
+          text: pickLocale(activeLocale, LOCALE_TEXT.noAssignedAgent),
           style: new TextStyle({ fontSize: 10, fill: 0x556677, fontFamily: "system-ui, sans-serif" }),
         });
         et.anchor.set(0.5, 0.5);
@@ -646,7 +912,7 @@ export default function OfficeView({
 
         // ── Name tag (above character) ──
         const nt = new Text({
-          text: agent.name_ko || agent.name,
+          text: activeLocale === "ko" ? (agent.name_ko || agent.name) : agent.name,
           style: new TextStyle({ fontSize: 7, fill: 0xffffff, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
         });
         nt.anchor.set(0.5, 0);
@@ -674,11 +940,16 @@ export default function OfficeView({
         }
 
         // Role badge (below name, above character)
-        const roleLabels: Record<string, string> = {
-          team_leader: "팀장", senior: "시니어", junior: "주니어", intern: "인턴",
-        };
         const rt = new Text({
-          text: roleLabels[agent.role] || agent.role,
+          text: pickLocale(
+            activeLocale,
+            LOCALE_TEXT.role[agent.role as keyof typeof LOCALE_TEXT.role] || {
+              ko: agent.role,
+              en: agent.role,
+              ja: agent.role,
+              zh: agent.role,
+            },
+          ),
           style: new TextStyle({ fontSize: 6, fill: 0xffffff, fontFamily: "system-ui, sans-serif" }),
         });
         rt.anchor.set(0.5, 0.5);
@@ -697,7 +968,7 @@ export default function OfficeView({
           // Desk (on top of empty chair)
           drawDesk(room, ax - DESK_W / 2, deskY, false);
           const awayTag = new Text({
-            text: "☕ 휴게실",
+            text: pickLocale(activeLocale, LOCALE_TEXT.breakRoom),
             style: new TextStyle({ fontSize: 7, fill: 0xe8a849, fontFamily: "system-ui, sans-serif" }),
           });
           awayTag.anchor.set(0.5, 0.5);
@@ -796,7 +1067,7 @@ export default function OfficeView({
           abBg.roundRect(sx - 10, sy - 6, 20, 10, 2).fill(0xf59e0b);
           room.addChild(abBg);
           const abTxt = new Text({
-            text: "알바",
+            text: pickLocale(activeLocale, LOCALE_TEXT.partTime),
             style: new TextStyle({ fontSize: 6, fill: 0x000000, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
           });
           abTxt.anchor.set(0.5, 0.5);
@@ -836,7 +1107,7 @@ export default function OfficeView({
     brSignBg.roundRect(brx + brw / 2 - brSignW / 2, bry - 4, brSignW, 18, 4).fill(BREAK_THEME.accent);
     breakRoom.addChild(brSignBg);
     const brSignTxt = new Text({
-      text: "☕ 휴게실",
+      text: pickLocale(activeLocale, LOCALE_TEXT.breakRoom),
       style: new TextStyle({ fontSize: 9, fill: 0xffffff, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
     });
     brSignTxt.anchor.set(0.5, 0.5);
@@ -916,7 +1187,7 @@ export default function OfficeView({
 
       // Small name tag
       const nameTag = new Text({
-        text: agent.name_ko || agent.name,
+        text: activeLocale === "ko" ? (agent.name_ko || agent.name) : agent.name,
         style: new TextStyle({ fontSize: 6, fill: 0xffffff, fontFamily: "system-ui, sans-serif" }),
       });
       nameTag.anchor.set(0.5, 0);
@@ -942,7 +1213,8 @@ export default function OfficeView({
           : (brx + brw - 16) + spot.x + ((seed % 7) - 3);
         const spotY = bry + spot.y + ((seed % 5) - 2) * 0.6;
 
-        const msg = BREAK_CHAT_MESSAGES[(seed + phase) % BREAK_CHAT_MESSAGES.length];
+        const chatPool = BREAK_CHAT_MESSAGES[activeLocale] || BREAK_CHAT_MESSAGES.ko;
+        const msg = chatPool[(seed + phase) % chatPool.length];
         const bubbleText = new Text({
           text: msg,
           style: new TextStyle({ fontSize: 7, fill: 0x333333, fontFamily: "system-ui, sans-serif" }),
@@ -1229,10 +1501,30 @@ export default function OfficeView({
 
         // Delivery animations
         const deliveries = deliveriesRef.current;
+        const now = Date.now();
         for (let i = deliveries.length - 1; i >= 0; i--) {
           const d = deliveries[i];
+          if (d.holdAtSeat && d.arrived) {
+            const idleBounce = Math.sin((tick + i * 13) * 0.045) * 1.1;
+            d.sprite.position.set(d.toX, d.toY - idleBounce);
+            d.sprite.alpha = 1;
+            if (d.holdUntil && now >= d.holdUntil) {
+              d.sprite.parent?.removeChild(d.sprite);
+              d.sprite.destroy({ children: true });
+              deliveries.splice(i, 1);
+            }
+            continue;
+          }
+
           d.progress += d.speed ?? DELIVERY_SPEED;
           if (d.progress >= 1) {
+            if (d.holdAtSeat) {
+              d.arrived = true;
+              d.progress = 1;
+              d.sprite.position.set(d.toX, d.toY);
+              d.sprite.alpha = 1;
+              continue;
+            }
             d.sprite.parent?.removeChild(d.sprite);
             d.sprite.destroy({ children: true });
             deliveries.splice(i, 1);
@@ -1324,7 +1616,7 @@ export default function OfficeView({
     if (initDoneRef.current && appRef.current) {
       buildScene();
     }
-  }, [departments, agents, tasks, subAgents, unreadAgentIds, buildScene]);
+  }, [departments, agents, tasks, subAgents, unreadAgentIds, language, buildScene]);
 
   /* ── CROSS-DEPT DELIVERY ANIMATIONS (walking character) ── */
   useEffect(() => {
@@ -1383,7 +1675,7 @@ export default function OfficeView({
       badge.roundRect(-16, 3, 32, 13, 4).stroke({ width: 1, color: 0xd97706, alpha: 0.5 });
       dc.addChild(badge);
       const badgeText = new Text({
-        text: "🤝 협업",
+        text: pickLocale(language, LOCALE_TEXT.collabBadge),
         style: new TextStyle({ fontSize: 7, fill: 0x000000, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
       });
       badgeText.anchor.set(0.5, 0.5);
@@ -1406,7 +1698,7 @@ export default function OfficeView({
 
       onCrossDeptDeliveryProcessed?.(cd.id);
     }
-  }, [crossDeptDeliveries, onCrossDeptDeliveryProcessed]);
+  }, [crossDeptDeliveries, onCrossDeptDeliveryProcessed, language]);
 
   /* ── CEO OFFICE CALL ANIMATIONS (leaders gather at 6P table) ── */
   useEffect(() => {
@@ -1415,14 +1707,72 @@ export default function OfficeView({
     const textures = texturesRef.current;
     if (!dlLayer) return;
 
+    const pickLine = (call: CeoOfficeCall) => {
+      const provided = call.line?.trim();
+      if (provided) return provided;
+      const pool = call.phase === "review"
+        ? pickLocale(language, LOCALE_TEXT.reviewLines)
+        : pickLocale(language, LOCALE_TEXT.kickoffLines);
+      return pool[hashStr(`${call.fromAgentId}-${call.id}`) % pool.length];
+    };
+
+    const renderSpeechBubble = (x: number, y: number, phase: "kickoff" | "review", line: string) => {
+      const bubble = new Container();
+      const bubbleText = new Text({
+        text: line,
+        style: new TextStyle({
+          fontSize: 7,
+          fill: 0x2b2b2b,
+          fontFamily: "system-ui, sans-serif",
+          wordWrap: true,
+          wordWrapWidth: 120,
+          breakWords: true,
+        }),
+      });
+      bubbleText.anchor.set(0.5, 1);
+      const bw = Math.min(bubbleText.width + 12, 122);
+      const bh = bubbleText.height + 8;
+      const by = -62;
+      const bubbleG = new Graphics();
+      bubbleG.roundRect(-bw / 2, by - bh, bw, bh, 4).fill(0xfff8e8);
+      bubbleG.roundRect(-bw / 2, by - bh, bw, bh, 4).stroke({
+        width: 1,
+        color: phase === "review" ? 0x34d399 : 0xf59e0b,
+        alpha: 0.6,
+      });
+      bubbleG.moveTo(-3, by).lineTo(0, by + 4).lineTo(3, by).fill(0xfff8e8);
+      bubble.addChild(bubbleG);
+      bubbleText.position.set(0, by - 4);
+      bubble.addChild(bubbleText);
+
+      bubble.position.set(x, y - 6);
+      dlLayer.addChild(bubble);
+
+      setTimeout(() => {
+        bubble.destroy({ children: true });
+      }, 2800);
+    };
+
     for (const call of ceoOfficeCalls) {
       if (processedCeoOfficeRef.current.has(call.id)) continue;
       processedCeoOfficeRef.current.add(call.id);
 
-      const fromPos = agentPosRef.current.get(call.fromAgentId);
       const seats = ceoMeetingSeatsRef.current;
       const seat = seats.length > 0 ? seats[call.seatIndex % seats.length] : null;
-      if (!fromPos || !seat) {
+      if (!seat) {
+        onCeoOfficeCallProcessed?.(call.id);
+        continue;
+      }
+
+      if (call.action === "speak") {
+        const line = pickLine(call);
+        renderSpeechBubble(seat.x, seat.y, call.phase, line);
+        onCeoOfficeCallProcessed?.(call.id);
+        continue;
+      }
+
+      const fromPos = agentPosRef.current.get(call.fromAgentId);
+      if (!fromPos) {
         onCeoOfficeCallProcessed?.(call.id);
         continue;
       }
@@ -1455,57 +1805,25 @@ export default function OfficeView({
       badge.roundRect(-24, 4, 48, 13, 4).stroke({ width: 1, color: 0x111111, alpha: 0.35 });
       dc.addChild(badge);
       const badgeText = new Text({
-        text: call.phase === "review" ? "✅ 승인" : "📣 회의",
+        text: call.phase === "review"
+          ? pickLocale(language, LOCALE_TEXT.meetingBadgeReview)
+          : pickLocale(language, LOCALE_TEXT.meetingBadgeKickoff),
         style: new TextStyle({ fontSize: 7, fill: 0x111111, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
       });
       badgeText.anchor.set(0.5, 0.5);
       badgeText.position.set(0, 10.5);
       dc.addChild(badgeText);
 
-      // Meeting speech bubble preview (UX: show leaders are actively discussing)
-      const kickoffLines = [
-        "유관부서 영향도 확인중",
-        "리스크/의존성 공유중",
-        "일정/우선순위 조율중",
-        "담당 경계 정의중",
-      ];
-      const reviewLines = [
-        "보완사항 반영 확인중",
-        "최종안 Approved 검토중",
-        "수정 아이디어 공유중",
-        "결과물 교차 검토중",
-      ];
-      const pool = call.phase === "review" ? reviewLines : kickoffLines;
-      const line = pool[hashStr(`${call.fromAgentId}-${call.id}`) % pool.length];
-
-      const bubbleText = new Text({
-        text: line,
-        style: new TextStyle({
-          fontSize: 7,
-          fill: 0x2b2b2b,
-          fontFamily: "system-ui, sans-serif",
-          wordWrap: true,
-          wordWrapWidth: 96,
-        }),
-      });
-      bubbleText.anchor.set(0.5, 1);
-      const bw = Math.min(bubbleText.width + 10, 106);
-      const bh = bubbleText.height + 6;
-      const by = -58;
-      const bubbleG = new Graphics();
-      bubbleG.roundRect(-bw / 2, by - bh, bw, bh, 4).fill(0xfff8e8);
-      bubbleG.roundRect(-bw / 2, by - bh, bw, bh, 4).stroke({
-        width: 1,
-        color: call.phase === "review" ? 0x34d399 : 0xf59e0b,
-        alpha: 0.55,
-      });
-      bubbleG.moveTo(-3, by).lineTo(0, by + 4).lineTo(3, by).fill(0xfff8e8);
-      dc.addChild(bubbleG);
-      bubbleText.position.set(0, by - 3);
-      dc.addChild(bubbleText);
-
       dc.position.set(fromPos.x, fromPos.y);
       dlLayer.addChild(dc);
+
+      for (let i = deliveriesRef.current.length - 1; i >= 0; i--) {
+        const d = deliveriesRef.current[i];
+        if (d.agentId !== call.fromAgentId) continue;
+        d.sprite.parent?.removeChild(d.sprite);
+        d.sprite.destroy({ children: true });
+        deliveriesRef.current.splice(i, 1);
+      }
 
       deliveriesRef.current.push({
         sprite: dc,
@@ -1516,11 +1834,14 @@ export default function OfficeView({
         progress: 0,
         speed: 0.0048,
         type: "walk",
+        agentId: call.fromAgentId,
+        holdAtSeat: true,
+        holdUntil: Date.now() + 95_000,
       });
 
       onCeoOfficeCallProcessed?.(call.id);
     }
-  }, [ceoOfficeCalls, onCeoOfficeCallProcessed]);
+  }, [ceoOfficeCalls, onCeoOfficeCallProcessed, language]);
 
   // ── CLI Usage Gauges ──
   const [cliStatus, setCliStatus] = useState<CliStatusMap | null>(null);
@@ -1612,17 +1933,17 @@ export default function OfficeView({
                     <path d="M12 6v6l4 2" />
                   </svg>
                 </span>
-                CLI Usage
+                {t(LOCALE_TEXT.cliUsageTitle)}
               </h3>
               <div className="flex items-center gap-2">
                 <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
-                  {connectedClis.length} connected
+                  {connectedClis.length} {t(LOCALE_TEXT.cliConnected)}
                 </span>
                 <button
                   onClick={handleRefreshUsage}
                   disabled={refreshing}
                   className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-800 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200 disabled:opacity-50"
-                  title="Refresh usage data"
+                  title={t(LOCALE_TEXT.cliRefreshTitle)}
                 >
                   <svg
                     width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
@@ -1651,18 +1972,18 @@ export default function OfficeView({
 
                     {/* Error / empty states */}
                     {usage?.error === "unauthenticated" && (
-                      <p className="text-[11px] text-slate-500 italic">not signed in</p>
+                      <p className="text-[11px] text-slate-500 italic">{t(LOCALE_TEXT.cliNotSignedIn)}</p>
                     )}
                     {usage?.error === "not_implemented" && (
-                      <p className="text-[11px] text-slate-500 italic">no usage API</p>
+                      <p className="text-[11px] text-slate-500 italic">{t(LOCALE_TEXT.cliNoApi)}</p>
                     )}
                     {usage?.error && usage.error !== "unauthenticated" && usage.error !== "not_implemented" && (
-                      <p className="text-[11px] text-slate-500 italic">unavailable</p>
+                      <p className="text-[11px] text-slate-500 italic">{t(LOCALE_TEXT.cliUnavailable)}</p>
                     )}
 
                     {/* Loading */}
                     {!usage && (
-                      <p className="text-[11px] text-slate-500 italic">loading...</p>
+                      <p className="text-[11px] text-slate-500 italic">{t(LOCALE_TEXT.cliLoading)}</p>
                     )}
 
                     {/* Window bars */}
@@ -1698,7 +2019,7 @@ export default function OfficeView({
                                   </span>
                                   {w.resetsAt && (
                                     <span className="text-slate-500">
-                                      resets {formatReset(w.resetsAt)}
+                                      {t(LOCALE_TEXT.cliResets)} {formatReset(w.resetsAt, language)}
                                     </span>
                                   )}
                                 </span>
@@ -1717,7 +2038,7 @@ export default function OfficeView({
 
                     {/* No windows but no error */}
                     {usage && !usage.error && usage.windows.length === 0 && (
-                      <p className="text-[11px] text-slate-500 italic">no data</p>
+                      <p className="text-[11px] text-slate-500 italic">{t(LOCALE_TEXT.cliNoData)}</p>
                     )}
                   </div>
                 );

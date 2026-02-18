@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import type { CompanyStats, Agent, Task } from '../types';
 import AgentAvatar from './AgentAvatar';
 
@@ -9,7 +9,62 @@ interface DashboardProps {
   companyName: string;
 }
 
-function useNow() {
+type Locale = 'ko' | 'en' | 'ja' | 'zh';
+type TFunction = (messages: Record<Locale, string>) => string;
+
+const LANGUAGE_STORAGE_KEY = 'climpire.language';
+const LOCALE_TAGS: Record<Locale, string> = {
+  ko: 'ko-KR',
+  en: 'en-US',
+  ja: 'ja-JP',
+  zh: 'zh-CN',
+};
+
+function normalizeLocale(value: string | null | undefined): Locale | null {
+  const code = (value ?? '').toLowerCase();
+  if (code.startsWith('ko')) return 'ko';
+  if (code.startsWith('en')) return 'en';
+  if (code.startsWith('ja')) return 'ja';
+  if (code.startsWith('zh')) return 'zh';
+  return null;
+}
+
+function detectLocale(): Locale {
+  if (typeof window === 'undefined') return 'en';
+  return (
+    normalizeLocale(window.localStorage.getItem(LANGUAGE_STORAGE_KEY)) ??
+    normalizeLocale(window.navigator.language) ??
+    'en'
+  );
+}
+
+function useI18n(preferredLocale?: string) {
+  const [locale, setLocale] = useState<Locale>(() => normalizeLocale(preferredLocale) ?? detectLocale());
+
+  useEffect(() => {
+    const preferred = normalizeLocale(preferredLocale);
+    if (preferred) setLocale(preferred);
+  }, [preferredLocale]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const sync = () => {
+      setLocale(normalizeLocale(preferredLocale) ?? detectLocale());
+    };
+    window.addEventListener('storage', sync);
+    window.addEventListener('climpire-language-change', sync as EventListener);
+    return () => {
+      window.removeEventListener('storage', sync);
+      window.removeEventListener('climpire-language-change', sync as EventListener);
+    };
+  }, [preferredLocale]);
+
+  const t = useCallback((messages: Record<Locale, string>) => messages[locale] ?? messages.en, [locale]);
+
+  return { locale, localeTag: LOCALE_TAGS[locale], t };
+}
+
+function useNow(localeTag: string, t: TFunction) {
   const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
@@ -19,34 +74,40 @@ function useNow() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const date = now.toLocaleDateString('ko-KR', {
+  const date = now.toLocaleDateString(localeTag, {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
     weekday: 'long',
   });
 
-  const time = now.toLocaleTimeString('ko-KR', {
+  const time = now.toLocaleTimeString(localeTag, {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
   });
 
   const hour = now.getHours();
-  const briefing = hour < 12 ? '오전 브리핑' : hour < 18 ? '오후 운영 점검' : '저녁 마감 점검';
+  const briefing =
+    hour < 12
+      ? t({ ko: '오전 브리핑', en: 'Morning Briefing', ja: '午前ブリーフィング', zh: '上午简报' })
+      : hour < 18
+        ? t({ ko: '오후 운영 점검', en: 'Afternoon Ops Check', ja: '午後運用点検', zh: '下午运行检查' })
+        : t({ ko: '저녁 마감 점검', en: 'Evening Wrap-up', ja: '夜間締め点検', zh: '晚间收尾检查' });
 
   return { date, time, briefing };
 }
 
-function timeAgo(timestamp: number): string {
+function timeAgo(timestamp: number, localeTag: string): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
-  if (seconds < 60) return `${seconds}초 전`;
+  const rtf = new Intl.RelativeTimeFormat(localeTag, { numeric: 'auto' });
+  if (seconds < 60) return rtf.format(-seconds, 'second');
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}분 전`;
+  if (minutes < 60) return rtf.format(-minutes, 'minute');
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}시간 전`;
+  if (hours < 24) return rtf.format(-hours, 'hour');
   const days = Math.floor(hours / 24);
-  return `${days}일 전`;
+  return rtf.format(-days, 'day');
 }
 
 // ─── RANK TIER SYSTEM ───
@@ -66,15 +127,36 @@ function getRankTier(xp: number) {
   return { ...RANK_TIERS[0], level: 0 };
 }
 
-const STATUS_LABELS: Record<string, { label: string; color: string; dot: string }> = {
-  inbox:       { label: '수신함', color: 'bg-slate-500/20 text-slate-200 border-slate-400/30', dot: 'bg-slate-400' },
-  planned:     { label: '계획됨', color: 'bg-blue-500/20 text-blue-100 border-blue-400/30',   dot: 'bg-blue-400' },
-  in_progress: { label: '진행 중', color: 'bg-amber-500/20 text-amber-100 border-amber-400/30', dot: 'bg-amber-400' },
-  review:      { label: '검토 중', color: 'bg-violet-500/20 text-violet-100 border-violet-400/30', dot: 'bg-violet-400' },
-  done:        { label: '완료',   color: 'bg-emerald-500/20 text-emerald-100 border-emerald-400/30', dot: 'bg-emerald-400' },
-  pending:     { label: '보류',   color: 'bg-orange-500/20 text-orange-100 border-orange-400/30', dot: 'bg-orange-400' },
-  cancelled:   { label: '취소됨', color: 'bg-rose-500/20 text-rose-100 border-rose-400/30',   dot: 'bg-rose-400' },
+const STATUS_LABELS: Record<string, { color: string; dot: string }> = {
+  inbox:       { color: 'bg-slate-500/20 text-slate-200 border-slate-400/30', dot: 'bg-slate-400' },
+  planned:     { color: 'bg-blue-500/20 text-blue-100 border-blue-400/30',   dot: 'bg-blue-400' },
+  in_progress: { color: 'bg-amber-500/20 text-amber-100 border-amber-400/30', dot: 'bg-amber-400' },
+  review:      { color: 'bg-violet-500/20 text-violet-100 border-violet-400/30', dot: 'bg-violet-400' },
+  done:        { color: 'bg-emerald-500/20 text-emerald-100 border-emerald-400/30', dot: 'bg-emerald-400' },
+  pending:     { color: 'bg-orange-500/20 text-orange-100 border-orange-400/30', dot: 'bg-orange-400' },
+  cancelled:   { color: 'bg-rose-500/20 text-rose-100 border-rose-400/30',   dot: 'bg-rose-400' },
 };
+
+function taskStatusLabel(status: string, t: TFunction) {
+  switch (status) {
+    case 'inbox':
+      return t({ ko: '수신함', en: 'Inbox', ja: '受信箱', zh: '收件箱' });
+    case 'planned':
+      return t({ ko: '계획됨', en: 'Planned', ja: '計画済み', zh: '已计划' });
+    case 'in_progress':
+      return t({ ko: '진행 중', en: 'In Progress', ja: '進行中', zh: '进行中' });
+    case 'review':
+      return t({ ko: '검토 중', en: 'Review', ja: 'レビュー', zh: '审核' });
+    case 'done':
+      return t({ ko: '완료', en: 'Done', ja: '完了', zh: '完成' });
+    case 'pending':
+      return t({ ko: '보류', en: 'Pending', ja: '保留', zh: '待处理' });
+    case 'cancelled':
+      return t({ ko: '취소됨', en: 'Cancelled', ja: 'キャンセル', zh: '已取消' });
+    default:
+      return status;
+  }
+}
 
 const DEPT_COLORS = [
   { bar: 'from-blue-500 to-cyan-400', badge: 'bg-blue-500/20 text-blue-200 border-blue-400/30' },
@@ -129,8 +211,10 @@ function RankBadge({ xp, size = 'md' }: { xp: number; size?: 'sm' | 'md' | 'lg' 
 }
 
 export default function Dashboard({ stats, agents, tasks, companyName }: DashboardProps) {
-  const { date, time, briefing } = useNow();
+  const { t, locale, localeTag } = useI18n();
+  const { date, time, briefing } = useNow(localeTag, t);
   const agentMap = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
+  const numberFormatter = useMemo(() => new Intl.NumberFormat(localeTag), [localeTag]);
 
   // ─── Stats (same logic) ───
   const totalTasks = stats?.tasks?.total ?? tasks.length;
@@ -167,7 +251,10 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
       if (!agent.department_id) continue;
       if (!deptMap.has(agent.department_id)) {
         deptMap.set(agent.department_id, {
-          name: agent.department?.name_ko ?? agent.department?.name ?? agent.department_id,
+          name:
+            locale === 'ko'
+              ? agent.department?.name_ko ?? agent.department?.name ?? agent.department_id
+              : agent.department?.name ?? agent.department?.name_ko ?? agent.department_id,
           icon: agent.department?.icon ?? '🏢',
           done: 0,
           total: 0,
@@ -189,7 +276,7 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
         color: DEPT_COLORS[i % DEPT_COLORS.length],
       }))
       .sort((a, b) => b.ratio - a.ratio || b.total - a.total);
-  }, [stats, agents, tasks]);
+  }, [stats, agents, tasks, locale]);
 
   // ─── Top agents (same logic) ───
   const topAgents = useMemo(() => {
@@ -198,8 +285,11 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
         const agent = agentMap.get(topAgent.id);
         return {
           id: topAgent.id,
-          name: agent?.name_ko ?? agent?.name ?? topAgent.name,
-          department: agent?.department?.name_ko ?? agent?.department?.name ?? '',
+          name: locale === 'ko' ? agent?.name_ko ?? agent?.name ?? topAgent.name : agent?.name ?? agent?.name_ko ?? topAgent.name,
+          department:
+            locale === 'ko'
+              ? agent?.department?.name_ko ?? agent?.department?.name ?? ''
+              : agent?.department?.name ?? agent?.department?.name_ko ?? '',
           tasksDone: topAgent.stats_tasks_done,
           xp: topAgent.stats_xp,
         };
@@ -210,12 +300,15 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
       .slice(0, 5)
       .map((agent) => ({
         id: agent.id,
-        name: agent.name_ko ?? agent.name,
-        department: agent.department?.name_ko ?? agent.department?.name ?? '',
+        name: locale === 'ko' ? agent.name_ko ?? agent.name : agent.name ?? agent.name_ko,
+        department:
+          locale === 'ko'
+            ? agent.department?.name_ko ?? agent.department?.name ?? ''
+            : agent.department?.name ?? agent.department?.name_ko ?? '',
         tasksDone: agent.stats_tasks_done,
         xp: agent.stats_xp,
       }));
-  }, [stats, agents, agentMap]);
+  }, [stats, agents, agentMap, locale]);
 
   const maxXp = topAgents.length > 0 ? Math.max(...topAgents.map((a) => a.xp), 1) : 1;
 
@@ -247,10 +340,43 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
 
   // ─── HUD Stats ───
   const hudStats = [
-    { id: 'total', label: 'MISSIONS', value: totalTasks, sub: '누적 태스크', color: '#3b82f6', icon: '📋' },
-    { id: 'clear', label: 'CLEAR RATE', value: `${completionRate}%`, sub: `${completedTasks} 클리어`, color: '#10b981', icon: '✅' },
-    { id: 'squad', label: 'SQUAD', value: `${activeAgents}/${totalAgents}`, sub: `가동률 ${activeRate}%`, color: '#00f0ff', icon: '🤖' },
-    { id: 'active', label: 'IN PROGRESS', value: inProgressTasks, sub: `계획 ${plannedTasks}건`, color: '#f59e0b', icon: '⚡' },
+    {
+      id: 'total',
+      label: t({ ko: '미션', en: 'MISSIONS', ja: 'ミッション', zh: '任务' }),
+      value: totalTasks,
+      sub: t({ ko: '누적 태스크', en: 'Total tasks', ja: '累積タスク', zh: '累计任务' }),
+      color: '#3b82f6',
+      icon: '📋',
+    },
+    {
+      id: 'clear',
+      label: t({ ko: '완료율', en: 'CLEAR RATE', ja: 'クリア率', zh: '完成率' }),
+      value: `${completionRate}%`,
+      sub: `${numberFormatter.format(completedTasks)} ${t({ ko: '클리어', en: 'cleared', ja: 'クリア', zh: '完成' })}`,
+      color: '#10b981',
+      icon: '✅',
+    },
+    {
+      id: 'squad',
+      label: t({ ko: '스쿼드', en: 'SQUAD', ja: 'スクワッド', zh: '小队' }),
+      value: `${activeAgents}/${totalAgents}`,
+      sub: `${t({ ko: '가동률', en: 'uptime', ja: '稼働率', zh: '运行率' })} ${activeRate}%`,
+      color: '#00f0ff',
+      icon: '🤖',
+    },
+    {
+      id: 'active',
+      label: t({ ko: '진행중', en: 'IN PROGRESS', ja: '進行中', zh: '进行中' }),
+      value: inProgressTasks,
+      sub: `${t({ ko: '계획', en: 'planned', ja: '計画', zh: '计划' })} ${numberFormatter.format(plannedTasks)}${t({
+        ko: '건',
+        en: '',
+        ja: '件',
+        zh: '项',
+      })}`,
+      color: '#f59e0b',
+      icon: '⚡',
+    },
   ];
 
   return (
@@ -282,10 +408,17 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
               </h1>
               <span className="flex items-center gap-1.5 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-widest text-emerald-300">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
-                LIVE
+                {t({ ko: '실시간', en: 'LIVE', ja: 'ライブ', zh: '实时' })}
               </span>
             </div>
-            <p className="text-xs text-slate-500">에이전트들이 실시간으로 미션을 수행 중입니다</p>
+            <p className="text-xs text-slate-500">
+              {t({
+                ko: '에이전트들이 실시간으로 미션을 수행 중입니다',
+                en: 'Agents are executing missions in real time',
+                ja: 'エージェントがリアルタイムでミッションを実行中です',
+                zh: '代理正在实时执行任务',
+              })}
+            </p>
           </div>
 
           <div className="flex items-center gap-3">
@@ -308,7 +441,8 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
             </div>
             {reviewQueue > 0 && (
               <span className="flex items-center gap-1.5 rounded-lg border border-orange-400/30 bg-orange-500/15 px-3 py-1.5 text-xs font-bold text-orange-300 animate-neon-pulse-orange">
-                🔔 대기 {reviewQueue}건
+                🔔 {t({ ko: '대기', en: 'Queued', ja: '待機', zh: '待处理' })} {numberFormatter.format(reviewQueue)}
+                {t({ ko: '건', en: '', ja: '件', zh: '项' })}
               </span>
             )}
           </div>
@@ -335,7 +469,7 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                   className="mt-1 text-3xl font-black tracking-tight"
                   style={{ color: stat.color, textShadow: `0 0 20px ${stat.color}40` }}
                 >
-                  {typeof stat.value === 'number' ? stat.value.toLocaleString('ko-KR') : stat.value}
+                  {typeof stat.value === 'number' ? numberFormatter.format(stat.value) : stat.value}
                 </p>
                 <p className="mt-0.5 text-[10px] text-slate-500">{stat.sub}</p>
               </div>
@@ -374,9 +508,11 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                   filter: 'drop-shadow(0 0 8px rgba(255,215,0,0.3))',
                 }}
               >
-                RANKING BOARD
+                {t({ ko: '랭킹 보드', en: 'RANKING BOARD', ja: 'ランキングボード', zh: '排行榜' })}
               </h2>
-              <p className="text-[10px] text-slate-500">XP 기준 에이전트 순위</p>
+              <p className="text-[10px] text-slate-500">
+                {t({ ko: 'XP 기준 에이전트 순위', en: 'Agent ranking by XP', ja: 'XP 基準のエージェント順位', zh: '按 XP 排名' })}
+              </p>
             </div>
           </div>
           <span className="rounded-md border border-white/[0.06] bg-white/[0.03] px-2.5 py-1 text-[10px] font-bold text-slate-400">
@@ -387,8 +523,15 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
         {topAgents.length === 0 ? (
           <div className="flex min-h-[200px] flex-col items-center justify-center gap-3 text-sm text-slate-500">
             <span className="text-4xl opacity-30">⚔️</span>
-            <p>등록된 에이전트가 없습니다</p>
-            <p className="text-[10px]">에이전트를 추가하고 미션을 시작하세요</p>
+            <p>{t({ ko: '등록된 에이전트가 없습니다', en: 'No agents registered', ja: '登録されたエージェントがいません', zh: '暂无已注册代理' })}</p>
+            <p className="text-[10px]">
+              {t({
+                ko: '에이전트를 추가하고 미션을 시작하세요',
+                en: 'Add agents and start missions',
+                ja: 'エージェントを追加してミッションを開始しましょう',
+                zh: '添加代理并开始任务',
+              })}
+            </p>
           </div>
         ) : (
           <div className="relative space-y-5">
@@ -451,7 +594,7 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                           className="font-mono text-xs font-bold"
                           style={{ color: tier.color, textShadow: `0 0 6px ${tier.glow}` }}
                         >
-                          {agent.xp.toLocaleString()} XP
+                          {numberFormatter.format(agent.xp)} XP
                         </span>
                         <RankBadge xp={agent.xp} size="sm" />
                       </div>
@@ -496,14 +639,17 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                       </div>
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-bold text-slate-200">{agent.name}</p>
-                        <p className="text-[10px] text-slate-500">{agent.department || '미지정'}</p>
+                        <p className="text-[10px] text-slate-500">
+                          {agent.department ||
+                            t({ ko: '미지정', en: 'Unassigned', ja: '未指定', zh: '未指定' })}
+                        </p>
                       </div>
                       <div className="hidden w-28 sm:block">
                         <XpBar xp={agent.xp} maxXp={maxXp} color={tier.color} />
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="font-mono text-xs font-bold" style={{ color: tier.color }}>
-                          {agent.xp.toLocaleString()}
+                          {numberFormatter.format(agent.xp)}
                         </span>
                         <RankBadge xp={agent.xp} size="sm" />
                       </div>
@@ -535,11 +681,14 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-base font-black" style={{ color: tier.color }}>{agent.name}</p>
-                    <p className="text-xs text-slate-400">{agent.department || '미지정'}</p>
+                    <p className="text-xs text-slate-400">
+                      {agent.department ||
+                        t({ ko: '미지정', en: 'Unassigned', ja: '未指定', zh: '未指定' })}
+                    </p>
                   </div>
                   <div className="text-right">
                     <p className="font-mono text-lg font-black" style={{ color: tier.color, textShadow: `0 0 10px ${tier.glow}` }}>
-                      {agent.xp.toLocaleString()} XP
+                      {numberFormatter.format(agent.xp)} XP
                     </p>
                     <RankBadge xp={agent.xp} size="md" />
                   </div>
@@ -562,14 +711,16 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
             >
               🏰
             </span>
-            DEPT. PERFORMANCE
-            <span className="ml-auto text-[9px] font-medium normal-case tracking-normal text-slate-500">부서별 성과</span>
+            {t({ ko: '부서 성과', en: 'DEPT. PERFORMANCE', ja: '部署パフォーマンス', zh: '部门绩效' })}
+            <span className="ml-auto text-[9px] font-medium normal-case tracking-normal text-slate-500">
+              {t({ ko: '부서별 성과', en: 'by department', ja: '部署別', zh: '按部门' })}
+            </span>
           </h2>
 
           {deptData.length === 0 ? (
             <div className="flex min-h-[200px] flex-col items-center justify-center gap-2 text-sm text-slate-500">
               <span className="text-3xl opacity-30">🏰</span>
-              데이터가 없습니다
+              {t({ ko: '데이터가 없습니다', en: 'No data available', ja: 'データがありません', zh: '暂无数据' })}
             </div>
           ) : (
             <div className="space-y-2.5">
@@ -598,8 +749,12 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                   </div>
 
                   <div className="mt-1.5 flex justify-between text-[9px] font-semibold uppercase tracking-wider text-slate-500">
-                    <span>클리어 {dept.done.toLocaleString('ko-KR')}</span>
-                    <span>전체 {dept.total.toLocaleString('ko-KR')}</span>
+                    <span>
+                      {t({ ko: '클리어', en: 'cleared', ja: 'クリア', zh: '完成' })} {numberFormatter.format(dept.done)}
+                    </span>
+                    <span>
+                      {t({ ko: '전체', en: 'total', ja: '全体', zh: '总计' })} {numberFormatter.format(dept.total)}
+                    </span>
                   </div>
                 </article>
               ))}
@@ -617,15 +772,15 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
               >
                 🤖
               </span>
-              SQUAD
+              {t({ ko: '스쿼드', en: 'SQUAD', ja: 'スクワッド', zh: '小队' })}
             </h2>
             <div className="flex items-center gap-2 text-[10px]">
               <span className="flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-500/10 px-2 py-0.5 font-bold text-emerald-300">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
-                ON {workingAgents.length}
+                {t({ ko: 'ON', en: 'ON', ja: 'ON', zh: '在线' })} {numberFormatter.format(workingAgents.length)}
               </span>
               <span className="flex items-center gap-1 rounded-md border border-slate-600/40 bg-slate-700/30 px-2 py-0.5 font-bold text-slate-400">
-                OFF {idleAgentsList.length}
+                {t({ ko: 'OFF', en: 'OFF', ja: 'OFF', zh: '离线' })} {numberFormatter.format(idleAgentsList.length)}
               </span>
             </div>
           </div>
@@ -639,7 +794,11 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
               return (
                 <div
                   key={agent.id}
-                  title={`${agent.name_ko ?? agent.name} — ${isWorking ? '작업 중' : '대기 중'} — ${tier.name}`}
+                  title={`${locale === 'ko' ? agent.name_ko ?? agent.name : agent.name ?? agent.name_ko} — ${
+                    isWorking
+                      ? t({ ko: '작업 중', en: 'Working', ja: '作業中', zh: '工作中' })
+                      : t({ ko: '대기 중', en: 'Idle', ja: '待機中', zh: '空闲' })
+                  } — ${tier.name}`}
                   className={`group relative flex flex-col items-center gap-1.5 ${isWorking ? 'animate-bubble-float' : ''}`}
                   style={isWorking ? { animationDelay: `${delay}ms` } : {}}
                 >
@@ -662,7 +821,7 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                   <span className={`max-w-[52px] truncate text-center text-[9px] font-bold leading-tight ${
                     isWorking ? 'text-slate-200' : 'text-slate-500'
                   }`}>
-                    {agent.name_ko ?? agent.name}
+                    {locale === 'ko' ? agent.name_ko ?? agent.name : agent.name ?? agent.name_ko}
                   </span>
                 </div>
               );
@@ -681,24 +840,26 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
             >
               📡
             </span>
-            MISSION LOG
-            <span className="ml-2 text-[9px] font-medium normal-case tracking-normal text-slate-500">최근 활동</span>
+            {t({ ko: '미션 로그', en: 'MISSION LOG', ja: 'ミッションログ', zh: '任务日志' })}
+            <span className="ml-2 text-[9px] font-medium normal-case tracking-normal text-slate-500">
+              {t({ ko: '최근 활동', en: 'Recent activity', ja: '最近の活動', zh: '最近活动' })}
+            </span>
           </h2>
           <span className="flex items-center gap-1.5 rounded-md border border-slate-600/40 bg-slate-700/30 px-2 py-0.5 text-[10px] font-bold text-slate-400">
-            유휴 {idleAgents}명
+            {t({ ko: '유휴', en: 'Idle', ja: '待機', zh: '空闲' })} {numberFormatter.format(idleAgents)}
+            {t({ ko: '명', en: '', ja: '人', zh: '人' })}
           </span>
         </div>
 
         {recentTasks.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 py-10 text-sm text-slate-500">
             <span className="text-3xl opacity-30">📡</span>
-            로그 없음
+            {t({ ko: '로그 없음', en: 'No logs', ja: 'ログなし', zh: '暂无日志' })}
           </div>
         ) : (
           <div className="space-y-2">
             {recentTasks.map((task) => {
               const statusInfo = STATUS_LABELS[task.status] ?? {
-                label: task.status,
                 color: 'bg-slate-600/20 text-slate-200 border-slate-500/30',
                 dot: 'bg-slate-400',
               };
@@ -726,15 +887,17 @@ export default function Dashboard({ stats, agents, tasks, companyName }: Dashboa
                     </p>
                     <p className="mt-0.5 flex items-center gap-1.5 text-[10px] text-slate-500">
                       <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${statusInfo.dot}`} />
-                      {assignedAgent ? (assignedAgent.name_ko ?? assignedAgent.name) : '미배정'}
+                      {assignedAgent
+                        ? (locale === 'ko' ? assignedAgent.name_ko : assignedAgent.name)
+                        : t({ ko: '미배정', en: 'Unassigned', ja: '未割り当て', zh: '未分配' })}
                     </p>
                   </div>
 
                   <div className="flex flex-col items-end gap-1">
                     <span className={`rounded-md border px-2 py-0.5 text-[9px] font-black uppercase tracking-wider ${statusInfo.color}`}>
-                      {statusInfo.label}
+                      {taskStatusLabel(task.status, t)}
                     </span>
-                    <span className="text-[9px] font-medium text-slate-500">{timeAgo(task.updated_at)}</span>
+                    <span className="text-[9px] font-medium text-slate-500">{timeAgo(task.updated_at, localeTag)}</span>
                   </div>
                 </article>
               );

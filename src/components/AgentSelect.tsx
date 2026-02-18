@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import type { Agent } from '../types';
 import AgentAvatar, { useSpriteMap } from './AgentAvatar';
+import { useI18n } from '../i18n';
+import type { LangText } from '../i18n';
 
 interface AgentSelectProps {
   agents: Agent[];
@@ -11,29 +13,46 @@ interface AgentSelectProps {
   className?: string;
 }
 
-const ROLE_LABELS: Record<string, string> = {
-  team_leader: '팀장',
-  senior: '시니어',
-  junior: '주니어',
-  intern: '인턴',
+const ROLE_LABELS: Record<string, LangText> = {
+  team_leader: { ko: '팀장', en: 'Team Leader', ja: 'チームリーダー', zh: '组长' },
+  senior: { ko: '시니어', en: 'Senior', ja: 'シニア', zh: '高级' },
+  junior: { ko: '주니어', en: 'Junior', ja: 'ジュニア', zh: '初级' },
+  intern: { ko: '인턴', en: 'Intern', ja: 'インターン', zh: '实习生' },
 };
 
 export default function AgentSelect({
   agents,
   value,
   onChange,
-  placeholder = '-- 담당자 없음 --',
+  placeholder,
   size = 'sm',
   className = '',
 }: AgentSelectProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const spriteMap = useSpriteMap(agents);
+  const { t, locale } = useI18n();
   const selected = agents.find((a) => a.id === value);
+  const isKorean = locale.startsWith('ko');
 
   const textSize = size === 'md' ? 'text-sm' : 'text-xs';
   const padY = size === 'md' ? 'py-2' : 'py-1';
   const avatarSize = size === 'md' ? 22 : 18;
+
+  const tr = (ko: string, en: string, ja = en, zh = en) =>
+    t({ ko, en, ja, zh });
+
+  const getAgentName = (agent: Agent) =>
+    isKorean ? agent.name_ko || agent.name : agent.name || agent.name_ko;
+
+  const getRoleLabel = (role: string) => {
+    const label = ROLE_LABELS[role];
+    return label ? t(label) : role;
+  };
+
+  const effectivePlaceholder =
+    placeholder ??
+    tr('-- 담당자 없음 --', '-- Unassigned --', '-- 担当者なし --', '-- 无负责人 --');
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -54,11 +73,11 @@ export default function AgentSelect({
         {selected ? (
           <>
             <AgentAvatar agent={selected} spriteMap={spriteMap} size={avatarSize} />
-            <span className="truncate">{selected.name_ko || selected.name}</span>
-            <span className="text-slate-500 text-[10px]">({ROLE_LABELS[selected.role] ?? selected.role})</span>
+            <span className="truncate">{getAgentName(selected)}</span>
+            <span className="text-slate-500 text-[10px]">({getRoleLabel(selected.role)})</span>
           </>
         ) : (
-          <span className="text-slate-500">{placeholder}</span>
+          <span className="text-slate-500">{effectivePlaceholder}</span>
         )}
         <svg className="ml-auto w-3 h-3 text-slate-500 flex-shrink-0" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M3 5l3 3 3-3" />
@@ -74,7 +93,7 @@ export default function AgentSelect({
             onClick={() => { onChange(''); setOpen(false); }}
             className={`w-full flex items-center gap-2 px-2 ${padY} ${textSize} text-slate-500 hover:bg-slate-700 transition-colors`}
           >
-            {placeholder}
+            {effectivePlaceholder}
           </button>
 
           {agents.map((a) => (
@@ -89,8 +108,8 @@ export default function AgentSelect({
               }`}
             >
               <AgentAvatar agent={a} spriteMap={spriteMap} size={avatarSize} />
-              <span className="truncate">{a.name_ko || a.name}</span>
-              <span className="text-slate-500 text-[10px]">({ROLE_LABELS[a.role] ?? a.role})</span>
+              <span className="truncate">{getAgentName(a)}</span>
+              <span className="text-slate-500 text-[10px]">({getRoleLabel(a.role)})</span>
               {a.status === 'working' && (
                 <span className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-400 flex-shrink-0" />
               )}

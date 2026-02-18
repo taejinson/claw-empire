@@ -20,6 +20,14 @@ import type {
   SubTask,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
+import {
+  detectBrowserLanguage,
+  I18nProvider,
+  LANGUAGE_STORAGE_KEY,
+  LANGUAGE_USER_SET_STORAGE_KEY,
+  normalizeLanguage,
+  pickLang,
+} from "./i18n";
 import * as api from "./api";
 
 interface SubAgent {
@@ -40,13 +48,41 @@ export interface CeoOfficeCall {
   fromAgentId: string;
   seatIndex: number;
   phase: "kickoff" | "review";
+  action?: "arrive" | "speak";
+  line?: string;
 }
 
 type View = "office" | "dashboard" | "tasks" | "skills" | "settings";
+type TaskPanelTab = "terminal" | "minutes";
 
 export interface OAuthCallbackResult {
   provider: string | null;
   error: string | null;
+}
+
+function mergeSettingsWithDefaults(
+  settings?: Partial<CompanySettings> | null
+): CompanySettings {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...(settings ?? {}),
+    language: normalizeLanguage(settings?.language ?? DEFAULT_SETTINGS.language),
+    providerModelConfig: {
+      ...(DEFAULT_SETTINGS.providerModelConfig ?? {}),
+      ...(settings?.providerModelConfig ?? {}),
+    },
+  };
+}
+
+function isUserLanguagePinned(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(LANGUAGE_USER_SET_STORAGE_KEY) === "1";
+}
+
+function syncClientLanguage(language: string): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(LANGUAGE_STORAGE_KEY, normalizeLanguage(language));
+  window.dispatchEvent(new Event("climpire-language-change"));
 }
 
 export default function App() {
@@ -57,7 +93,9 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [stats, setStats] = useState<CompanyStats | null>(null);
-  const [settings, setSettings] = useState<CompanySettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<CompanySettings>(() =>
+    mergeSettingsWithDefaults({ language: detectBrowserLanguage() })
+  );
   const [cliStatus, setCliStatus] = useState<CliStatusMap | null>(null);
   const [subAgents, setSubAgents] = useState<SubAgent[]>([]);
   const [subtasks, setSubtasks] = useState<SubTask[]>([]);
@@ -66,7 +104,7 @@ export default function App() {
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
   const [chatAgent, setChatAgent] = useState<Agent | null>(null);
   const [showChat, setShowChat] = useState(false);
-  const [terminalTaskId, setTerminalTaskId] = useState<string | null>(null);
+  const [taskPanel, setTaskPanel] = useState<{ taskId: string; tab: TaskPanelTab } | null>(null);
   const [loading, setLoading] = useState(true);
   const [unreadAgentIds, setUnreadAgentIds] = useState<Set<string>>(new Set());
   const [crossDeptDeliveries, setCrossDeptDeliveries] = useState<CrossDeptDelivery[]>([]);
@@ -115,7 +153,24 @@ export default function App() {
       setAgents(ags);
       setTasks(tks);
       setStats(sts);
-      setSettings(sett);
+      const mergedSettings = mergeSettingsWithDefaults(sett);
+      const autoDetectedLanguage = detectBrowserLanguage();
+      const shouldAutoAssignLanguage = !isUserLanguagePinned();
+      const nextSettings = shouldAutoAssignLanguage
+        ? { ...mergedSettings, language: autoDetectedLanguage }
+        : mergedSettings;
+
+      setSettings(nextSettings);
+      syncClientLanguage(nextSettings.language);
+
+      if (
+        shouldAutoAssignLanguage &&
+        mergedSettings.language !== autoDetectedLanguage
+      ) {
+        api.saveSettings(nextSettings).catch((error) => {
+          console.error("Auto language sync failed:", error);
+        });
+      }
       setSubtasks(subs);
     } catch (e) {
       console.error("Failed to fetch data:", e);
@@ -203,6 +258,8 @@ export default function App() {
           from_agent_id: string;
           seat_index?: number;
           phase?: "kickoff" | "review";
+          action?: "arrive" | "speak";
+          line?: string;
         };
         if (!p.from_agent_id) return;
         setCeoOfficeCalls((prev) => [
@@ -212,6 +269,8 @@ export default function App() {
             fromAgentId: p.from_agent_id,
             seatIndex: p.seat_index ?? 0,
             phase: p.phase ?? "kickoff",
+            action: p.action ?? "arrive",
+            line: p.line,
           },
         ]);
       }),
@@ -411,8 +470,13 @@ export default function App() {
 
   async function handleSaveSettings(s: CompanySettings) {
     try {
-      await api.saveSettings(s);
-      setSettings(s);
+      const nextSettings = mergeSettingsWithDefaults(s);
+      await api.saveSettings(nextSettings);
+      setSettings(nextSettings);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LANGUAGE_USER_SET_STORAGE_KEY, "1");
+      }
+      syncClientLanguage(nextSettings.language);
     } catch (e) {
       console.error("Save settings failed:", e);
     }
@@ -435,217 +499,278 @@ export default function App() {
       .catch(console.error);
   }
 
+  const uiLanguage = normalizeLanguage(settings.language);
+  const loadingTitle = pickLang(uiLanguage, {
+    ko: "CLImpire 로딩 중...",
+    en: "Loading CLImpire...",
+    ja: "CLImpireを読み込み中...",
+    zh: "CLImpire 加载中...",
+  });
+  const loadingSubtitle = pickLang(uiLanguage, {
+    ko: "AI 에이전트 제국을 준비하고 있습니다",
+    en: "Preparing your AI agent empire",
+    ja: "AIエージェント帝国を準備しています",
+    zh: "正在准备你的 AI 代理帝国",
+  });
+  const viewTitle = (() => {
+    switch (view) {
+      case "office":
+        return `🏢 ${pickLang(uiLanguage, {
+          ko: "오피스",
+          en: "Office",
+          ja: "オフィス",
+          zh: "办公室",
+        })}`;
+      case "dashboard":
+        return `📊 ${pickLang(uiLanguage, {
+          ko: "대시보드",
+          en: "Dashboard",
+          ja: "ダッシュボード",
+          zh: "仪表盘",
+        })}`;
+      case "tasks":
+        return `📋 ${pickLang(uiLanguage, {
+          ko: "업무 관리",
+          en: "Tasks",
+          ja: "タスク管理",
+          zh: "任务管理",
+        })}`;
+      case "skills":
+        return `📚 ${pickLang(uiLanguage, {
+          ko: "문서고",
+          en: "Skills",
+          ja: "スキル資料室",
+          zh: "技能库",
+        })}`;
+      case "settings":
+        return `⚙️ ${pickLang(uiLanguage, {
+          ko: "설정",
+          en: "Settings",
+          ja: "設定",
+          zh: "设置",
+        })}`;
+      default:
+        return "";
+    }
+  })();
+  const announcementLabel = `📢 ${pickLang(uiLanguage, {
+    ko: "전사 공지",
+    en: "Announcement",
+    ja: "全社告知",
+    zh: "全员公告",
+  })}`;
+
   if (loading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-slate-900">
-        <div className="text-center">
-          <div className="text-5xl mb-4 animate-agent-bounce">🏢</div>
-          <div className="text-lg text-slate-400 font-medium">
-            CLImpire 로딩 중...
-          </div>
-          <div className="text-sm text-slate-500 mt-1">
-            AI 에이전트 제국을 준비하고 있습니다
+      <I18nProvider language={uiLanguage}>
+        <div className="h-screen flex items-center justify-center bg-slate-900">
+          <div className="text-center">
+            <div className="text-5xl mb-4 animate-agent-bounce">🏢</div>
+            <div className="text-lg text-slate-400 font-medium">
+              {loadingTitle}
+            </div>
+            <div className="text-sm text-slate-500 mt-1">
+              {loadingSubtitle}
+            </div>
           </div>
         </div>
-      </div>
+      </I18nProvider>
     );
   }
 
   return (
-    <div className="h-screen flex overflow-hidden bg-slate-900">
-      {/* Sidebar */}
-      <Sidebar
-        currentView={view}
-        onChangeView={setView}
-        departments={departments}
-        agents={agents}
-        settings={settings}
-        connected={connected}
-      />
-
-      {/* Main Content */}
-      <main className="flex-1 overflow-y-auto overflow-x-hidden min-w-0">
-        {/* Top Bar */}
-        <header className="sticky top-0 z-30 bg-slate-900/80 backdrop-blur-sm border-b border-slate-700/50 px-6 py-3 flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-bold text-white">
-              {view === "office" && "🏢 오피스"}
-              {view === "dashboard" && "📊 대시보드"}
-              {view === "tasks" && "📋 업무 관리"}
-              {view === "skills" && "📚 문서고"}
-              {view === "settings" && "⚙️ 설정"}
-            </h1>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => {
-                setChatAgent(null);
-                setShowChat(true);
-                api
-                  .getMessages({ receiver_type: "all", limit: 50 })
-                  .then(setMessages)
-                  .catch(console.error);
-              }}
-              className="px-3 py-1.5 text-sm bg-amber-600/20 text-amber-400 border border-amber-500/30 rounded-lg hover:bg-amber-600/30 transition-colors"
-            >
-              📢 전사 공지
-            </button>
-            <div className="flex items-center gap-2 text-xs text-slate-500">
-              <div
-                className={`w-2 h-2 rounded-full ${
-                  connected ? "bg-green-500" : "bg-red-500"
-                }`}
-              />
-              {connected ? "Live" : "Offline"}
-            </div>
-          </div>
-        </header>
-
-        {/* Views */}
-        <div className="p-6">
-          {view === "office" && (
-            <OfficeView
-              departments={departments}
-              agents={agents}
-              tasks={tasks}
-              subAgents={subAgents}
-              unreadAgentIds={unreadAgentIds}
-              crossDeptDeliveries={crossDeptDeliveries}
-              onCrossDeptDeliveryProcessed={(id) =>
-                setCrossDeptDeliveries((prev) => prev.filter((d) => d.id !== id))
-              }
-              ceoOfficeCalls={ceoOfficeCalls}
-              onCeoOfficeCallProcessed={(id) =>
-                setCeoOfficeCalls((prev) => prev.filter((d) => d.id !== id))
-              }
-              onSelectAgent={(a) => setSelectedAgent(a)}
-              onSelectDepartment={(dept) => {
-                const leader = agents.find(
-                  (a) => a.department_id === dept.id && a.role === "team_leader"
-                );
-                if (leader) {
-                  handleOpenChat(leader);
-                }
-              }}
-            />
-          )}
-
-          {view === "dashboard" && (
-            <Dashboard
-              stats={stats}
-              agents={agents}
-              tasks={tasks}
-              companyName={settings.companyName}
-            />
-          )}
-
-          {view === "tasks" && (
-            <TaskBoard
-              tasks={tasks}
-              agents={agents}
-              departments={departments}
-              subtasks={subtasks}
-              onCreateTask={handleCreateTask}
-              onUpdateTask={handleUpdateTask}
-              onDeleteTask={handleDeleteTask}
-              onAssignTask={handleAssignTask}
-              onRunTask={handleRunTask}
-              onStopTask={handleStopTask}
-              onPauseTask={handlePauseTask}
-              onResumeTask={handleResumeTask}
-              onOpenTerminal={(id) => setTerminalTaskId(id)}
-            />
-          )}
-
-          {view === "skills" && <SkillsLibrary />}
-
-          {view === "settings" && (
-            <SettingsPanel
-              settings={settings}
-              cliStatus={cliStatus}
-              onSave={handleSaveSettings}
-              onRefreshCli={() =>
-                api.getCliStatus(true).then(setCliStatus).catch(console.error)
-              }
-              oauthResult={oauthResult}
-              onOauthResultClear={() => setOauthResult(null)}
-            />
-          )}
-        </div>
-      </main>
-
-      {/* Chat Panel (slide-in) */}
-      {showChat && (
-        <ChatPanel
-          selectedAgent={chatAgent}
-          messages={messages}
-          agents={agents}
-          onSendMessage={handleSendMessage}
-          onSendAnnouncement={handleSendAnnouncement}
-          onClearMessages={async (agentId) => {
-            try {
-              await api.clearMessages(agentId);
-              setMessages([]);
-            } catch (e) {
-              console.error("Clear messages failed:", e);
-            }
-          }}
-          onClose={() => setShowChat(false)}
-        />
-      )}
-
-      {/* Agent Detail Modal */}
-      {selectedAgent && (
-        <AgentDetail
-          agent={selectedAgent}
-          agents={agents}
-          department={departments.find(
-            (d) => d.id === selectedAgent.department_id
-          )}
+    <I18nProvider language={uiLanguage}>
+      <div className="h-screen flex overflow-hidden bg-slate-900">
+        {/* Sidebar */}
+        <Sidebar
+          currentView={view}
+          onChangeView={setView}
           departments={departments}
-          tasks={tasks}
-          subAgents={subAgents}
-          subtasks={subtasks}
-          onClose={() => setSelectedAgent(null)}
-          onChat={(a) => {
-            setSelectedAgent(null);
-            handleOpenChat(a);
-          }}
-          onAssignTask={() => {
-            setSelectedAgent(null);
-            setView("tasks");
-          }}
-          onOpenTerminal={(id) => {
-            setSelectedAgent(null);
-            setTerminalTaskId(id);
-          }}
-          onAgentUpdated={() => {
-            api.getAgents().then((ags) => {
-              setAgents(ags);
-              // Refresh selected agent with updated data
-              if (selectedAgent) {
-                const updated = ags.find(a => a.id === selectedAgent.id);
-                if (updated) setSelectedAgent(updated);
-              }
-            }).catch(console.error);
-          }}
-        />
-      )}
-
-      {/* Terminal Panel (slide-in from right) */}
-      {terminalTaskId && (
-        <TerminalPanel
-          taskId={terminalTaskId}
-          task={tasks.find((t) => t.id === terminalTaskId)}
-          agent={agents.find(
-            (a) =>
-              a.current_task_id === terminalTaskId ||
-              tasks.find((t) => t.id === terminalTaskId)?.assigned_agent_id === a.id
-          )}
           agents={agents}
-          onClose={() => setTerminalTaskId(null)}
+          settings={settings}
+          connected={connected}
         />
-      )}
-    </div>
+
+        {/* Main Content */}
+        <main className="flex-1 overflow-y-auto overflow-x-hidden min-w-0">
+          {/* Top Bar */}
+          <header className="sticky top-0 z-30 bg-slate-900/80 backdrop-blur-sm border-b border-slate-700/50 px-6 py-3 flex items-center justify-between">
+            <div>
+              <h1 className="text-lg font-bold text-white">{viewTitle}</h1>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => {
+                  setChatAgent(null);
+                  setShowChat(true);
+                  api
+                    .getMessages({ receiver_type: "all", limit: 50 })
+                    .then(setMessages)
+                    .catch(console.error);
+                }}
+                className="px-3 py-1.5 text-sm bg-amber-600/20 text-amber-400 border border-amber-500/30 rounded-lg hover:bg-amber-600/30 transition-colors"
+              >
+                {announcementLabel}
+              </button>
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <div
+                  className={`w-2 h-2 rounded-full ${
+                    connected ? "bg-green-500" : "bg-red-500"
+                  }`}
+                />
+                {connected ? "Live" : "Offline"}
+              </div>
+            </div>
+          </header>
+
+          {/* Views */}
+          <div className="p-6">
+            {view === "office" && (
+              <OfficeView
+                departments={departments}
+                agents={agents}
+                tasks={tasks}
+                subAgents={subAgents}
+                unreadAgentIds={unreadAgentIds}
+                crossDeptDeliveries={crossDeptDeliveries}
+                onCrossDeptDeliveryProcessed={(id) =>
+                  setCrossDeptDeliveries((prev) => prev.filter((d) => d.id !== id))
+                }
+                ceoOfficeCalls={ceoOfficeCalls}
+                onCeoOfficeCallProcessed={(id) =>
+                  setCeoOfficeCalls((prev) => prev.filter((d) => d.id !== id))
+                }
+                onSelectAgent={(a) => setSelectedAgent(a)}
+                onSelectDepartment={(dept) => {
+                  const leader = agents.find(
+                    (a) => a.department_id === dept.id && a.role === "team_leader"
+                  );
+                  if (leader) {
+                    handleOpenChat(leader);
+                  }
+                }}
+              />
+            )}
+
+            {view === "dashboard" && (
+              <Dashboard
+                stats={stats}
+                agents={agents}
+                tasks={tasks}
+                companyName={settings.companyName}
+              />
+            )}
+
+            {view === "tasks" && (
+              <TaskBoard
+                tasks={tasks}
+                agents={agents}
+                departments={departments}
+                subtasks={subtasks}
+                onCreateTask={handleCreateTask}
+                onUpdateTask={handleUpdateTask}
+                onDeleteTask={handleDeleteTask}
+                onAssignTask={handleAssignTask}
+                onRunTask={handleRunTask}
+                onStopTask={handleStopTask}
+                onPauseTask={handlePauseTask}
+                onResumeTask={handleResumeTask}
+                onOpenTerminal={(id) => setTaskPanel({ taskId: id, tab: "terminal" })}
+                onOpenMeetingMinutes={(id) => setTaskPanel({ taskId: id, tab: "minutes" })}
+              />
+            )}
+
+            {view === "skills" && <SkillsLibrary />}
+
+            {view === "settings" && (
+              <SettingsPanel
+                settings={settings}
+                cliStatus={cliStatus}
+                onSave={handleSaveSettings}
+                onRefreshCli={() =>
+                  api.getCliStatus(true).then(setCliStatus).catch(console.error)
+                }
+                oauthResult={oauthResult}
+                onOauthResultClear={() => setOauthResult(null)}
+              />
+            )}
+          </div>
+        </main>
+
+        {/* Chat Panel (slide-in) */}
+        {showChat && (
+          <ChatPanel
+            selectedAgent={chatAgent}
+            messages={messages}
+            agents={agents}
+            onSendMessage={handleSendMessage}
+            onSendAnnouncement={handleSendAnnouncement}
+            onClearMessages={async (agentId) => {
+              try {
+                await api.clearMessages(agentId);
+                setMessages([]);
+              } catch (e) {
+                console.error("Clear messages failed:", e);
+              }
+            }}
+            onClose={() => setShowChat(false)}
+          />
+        )}
+
+        {/* Agent Detail Modal */}
+        {selectedAgent && (
+          <AgentDetail
+            agent={selectedAgent}
+            agents={agents}
+            department={departments.find(
+              (d) => d.id === selectedAgent.department_id
+            )}
+            departments={departments}
+            tasks={tasks}
+            subAgents={subAgents}
+            subtasks={subtasks}
+            onClose={() => setSelectedAgent(null)}
+            onChat={(a) => {
+              setSelectedAgent(null);
+              handleOpenChat(a);
+            }}
+            onAssignTask={() => {
+              setSelectedAgent(null);
+              setView("tasks");
+            }}
+            onOpenTerminal={(id) => {
+              setSelectedAgent(null);
+              setTaskPanel({ taskId: id, tab: "terminal" });
+            }}
+            onAgentUpdated={() => {
+              api.getAgents().then((ags) => {
+                setAgents(ags);
+                // Refresh selected agent with updated data
+                if (selectedAgent) {
+                  const updated = ags.find(a => a.id === selectedAgent.id);
+                  if (updated) setSelectedAgent(updated);
+                }
+              }).catch(console.error);
+            }}
+          />
+        )}
+
+        {/* Terminal Panel (slide-in from right) */}
+        {taskPanel && (
+          <TerminalPanel
+            taskId={taskPanel.taskId}
+            initialTab={taskPanel.tab}
+            task={tasks.find((t) => t.id === taskPanel.taskId)}
+            agent={agents.find(
+              (a) =>
+                a.current_task_id === taskPanel.taskId ||
+                tasks.find((t) => t.id === taskPanel.taskId)?.assigned_agent_id === a.id
+            )}
+            agents={agents}
+            onClose={() => setTaskPanel(null)}
+          />
+        )}
+      </div>
+    </I18nProvider>
   );
 }

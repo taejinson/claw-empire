@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Department, Agent, CompanySettings } from "../types";
+import { useI18n } from "../i18n";
 
 type View = "office" | "dashboard" | "tasks" | "skills" | "settings";
 
@@ -12,12 +13,12 @@ interface SidebarProps {
   connected: boolean;
 }
 
-const NAV_ITEMS: { view: View; icon: string; label: string }[] = [
-  { view: "office", icon: "🏢", label: "오피스" },
-  { view: "skills", icon: "📚", label: "문서고" },
-  { view: "dashboard", icon: "📊", label: "대시보드" },
-  { view: "tasks", icon: "📋", label: "업무 관리" },
-  { view: "settings", icon: "⚙️", label: "설정" },
+const NAV_ITEMS: { view: View; icon: string }[] = [
+  { view: "office", icon: "🏢" },
+  { view: "skills", icon: "📚" },
+  { view: "dashboard", icon: "📊" },
+  { view: "tasks", icon: "📋" },
+  { view: "settings", icon: "⚙️" },
 ];
 
 export default function Sidebar({
@@ -29,8 +30,21 @@ export default function Sidebar({
   connected,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
+  const { t, locale } = useI18n();
   const workingCount = agents.filter((a) => a.status === "working").length;
   const totalAgents = agents.length;
+  const isKorean = locale.startsWith("ko");
+
+  const tr = (ko: string, en: string, ja = en, zh = en) =>
+    t({ ko, en, ja, zh });
+
+  const navLabels: Record<View, string> = {
+    office: tr("오피스", "Office", "オフィス", "办公室"),
+    skills: tr("문서고", "Library", "ライブラリ", "文档库"),
+    dashboard: tr("대시보드", "Dashboard", "ダッシュボード", "仪表盘"),
+    tasks: tr("업무 관리", "Tasks", "タスク管理", "任务管理"),
+    settings: tr("설정", "Settings", "設定", "设置"),
+  };
 
   return (
     <aside
@@ -47,7 +61,7 @@ export default function Sidebar({
           <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 relative overflow-visible">
             <img
               src="/sprites/ceo-lobster.png"
-              alt="CEO"
+              alt={tr("CEO", "CEO")}
               className="w-8 h-8 object-contain"
               style={{ imageRendering: 'pixelated' }}
             />
@@ -79,7 +93,7 @@ export default function Sidebar({
             }`}
           >
             <span className="text-base shrink-0">{item.icon}</span>
-            {!collapsed && <span>{item.label}</span>}
+            {!collapsed && <span>{navLabels[item.view]}</span>}
           </button>
         ))}
       </nav>
@@ -88,7 +102,7 @@ export default function Sidebar({
       {!collapsed && (
         <div className="px-3 py-2 border-t border-slate-700/50">
           <div className="text-[10px] uppercase text-slate-500 font-semibold mb-1.5 tracking-wider">
-            부서 현황
+            {tr("부서 현황", "Department Status", "部門状況", "部门状态")}
           </div>
           {departments.map((d) => {
             const deptAgents = agents.filter(
@@ -103,7 +117,9 @@ export default function Sidebar({
                 className="flex items-center gap-1.5 py-0.5 text-xs text-slate-400"
               >
                 <span>{d.icon}</span>
-                <span className="flex-1 truncate">{d.name_ko}</span>
+                <span className="flex-1 truncate">
+                  {isKorean ? d.name_ko || d.name : d.name || d.name_ko}
+                </span>
                 <span
                   className={
                     working > 0 ? "text-blue-400 font-medium" : ""
@@ -127,8 +143,11 @@ export default function Sidebar({
           />
           {!collapsed && (
             <div className="text-[10px] text-slate-500">
-              {connected ? "연결됨" : "연결 끊김"} · {workingCount}/
-              {totalAgents} 근무중
+              {connected
+                ? tr("연결됨", "Connected", "接続中", "已连接")
+                : tr("연결 끊김", "Disconnected", "接続なし", "已断开")}{" "}
+              · {workingCount}/{totalAgents}{" "}
+              {tr("근무중", "working", "稼働中", "工作中")}
             </div>
           )}
         </div>
