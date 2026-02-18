@@ -86,12 +86,14 @@ export default function TerminalPanel({ taskId, task, agent, agents, initialTab 
   // Poll terminal endpoint every 1.5s
   const fetchTerminal = useCallback(async () => {
     try {
-      const res = await api.getTerminal(taskId, 800, true);
+      const res = await api.getTerminal(taskId, 4000, true);
       if (res.ok) {
         setLogPath(res.path);
         if (res.task_logs) setTaskLogs(res.task_logs);
-        if (res.exists && res.text) {
-          setText(res.text);
+        if (res.exists) {
+          setText(res.text ?? '');
+        } else {
+          setText('');
         }
       }
     } catch {

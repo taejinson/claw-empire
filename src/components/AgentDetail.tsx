@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
 import type { Agent, Task, Department, SubTask } from "../types";
 import * as api from "../api";
+import type { OAuthStatus, OAuthAccountInfo } from "../api";
 import AgentAvatar from "./AgentAvatar";
 
 interface SubAgent {
@@ -133,6 +134,10 @@ const SUBTASK_STATUS_ICON: Record<string, string> = {
   blocked: '\uD83D\uDEAB',
 };
 
+function oauthAccountLabel(account: OAuthAccountInfo): string {
+  return account.label || account.email || account.id.slice(0, 8);
+}
+
 function statusLabel(status: string, t: TFunction) {
   switch (status) {
     case "idle":
@@ -206,7 +211,10 @@ export default function AgentDetail({
   const [tab, setTab] = useState<"info" | "tasks" | "alba">("info");
   const [editingCli, setEditingCli] = useState(false);
   const [selectedCli, setSelectedCli] = useState(agent.cli_provider);
+  const [selectedOAuthAccountId, setSelectedOAuthAccountId] = useState(agent.oauth_account_id ?? "");
   const [savingCli, setSavingCli] = useState(false);
+  const [oauthStatus, setOauthStatus] = useState<OAuthStatus | null>(null);
+  const [oauthLoading, setOauthLoading] = useState(false);
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const agentTasks = tasks.filter((t) => t.assigned_agent_id === agent.id);
 
@@ -223,9 +231,44 @@ export default function AgentDetail({
   );
   const statusCfg = STATUS_CONFIG[agent.status] ?? STATUS_CONFIG.idle;
   const doneTasks = agentTasks.filter((t) => t.status === "done").length;
+  const oauthProviderKey =
+    selectedCli === "copilot" ? "github-copilot" : selectedCli === "antigravity" ? "antigravity" : null;
+  const activeOAuthAccounts = useMemo(() => {
+    if (!oauthProviderKey || !oauthStatus) return [];
+    return (oauthStatus.providers[oauthProviderKey]?.accounts ?? []).filter(
+      (a) => a.active && a.status === "active",
+    );
+  }, [oauthProviderKey, oauthStatus]);
+  const requiresOAuthAccount = selectedCli === "copilot" || selectedCli === "antigravity";
+  const canSaveCli = !requiresOAuthAccount || Boolean(selectedOAuthAccountId);
 
   const xpLevel = Math.floor(agent.stats_xp / 100) + 1;
   const xpProgress = agent.stats_xp % 100;
+
+  useEffect(() => {
+    setSelectedCli(agent.cli_provider);
+    setSelectedOAuthAccountId(agent.oauth_account_id ?? "");
+  }, [agent.id, agent.cli_provider, agent.oauth_account_id]);
+
+  useEffect(() => {
+    if (!editingCli || !requiresOAuthAccount) return;
+    setOauthLoading(true);
+    api.getOAuthStatus()
+      .then(setOauthStatus)
+      .catch((err) => console.error("Failed to load OAuth status:", err))
+      .finally(() => setOauthLoading(false));
+  }, [editingCli, requiresOAuthAccount]);
+
+  useEffect(() => {
+    if (!requiresOAuthAccount) {
+      if (selectedOAuthAccountId) setSelectedOAuthAccountId("");
+      return;
+    }
+    if (activeOAuthAccounts.length === 0) return;
+    if (!selectedOAuthAccountId || !activeOAuthAccounts.some((a) => a.id === selectedOAuthAccountId)) {
+      setSelectedOAuthAccountId(activeOAuthAccounts[0].id);
+    }
+  }, [requiresOAuthAccount, activeOAuthAccounts, selectedOAuthAccountId]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -295,12 +338,43 @@ export default function AgentDetail({
                         <option key={key} value={key}>{label}</option>
                       ))}
                     </select>
+                    {requiresOAuthAccount && (
+                      oauthLoading ? (
+                        <span className="text-[10px] text-slate-400">
+                          {t({ ko: "계정 로딩...", en: "Loading accounts...", ja: "アカウント読み込み中...", zh: "正在加载账号..." })}
+                        </span>
+                      ) : activeOAuthAccounts.length > 0 ? (
+                        <select
+                          value={selectedOAuthAccountId}
+                          onChange={(e) => setSelectedOAuthAccountId(e.target.value)}
+                          className="bg-slate-700 text-slate-200 text-xs rounded px-1.5 py-0.5 border border-slate-600 focus:outline-none focus:border-blue-500 max-w-[170px]"
+                        >
+                          {activeOAuthAccounts.map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              {oauthAccountLabel(acc)}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-[10px] text-amber-300">
+                          {t({
+                            ko: "활성 OAuth 계정 없음",
+                            en: "No active OAuth account",
+                            ja: "有効な OAuth アカウントなし",
+                            zh: "没有可用的 OAuth 账号",
+                          })}
+                        </span>
+                      )
+                    )}
                     <button
-                      disabled={savingCli}
+                      disabled={savingCli || !canSaveCli}
                       onClick={async () => {
                         setSavingCli(true);
                         try {
-                          await api.updateAgent(agent.id, { cli_provider: selectedCli });
+                          await api.updateAgent(agent.id, {
+                            cli_provider: selectedCli,
+                            oauth_account_id: requiresOAuthAccount ? (selectedOAuthAccountId || null) : null,
+                          });
                           onAgentUpdated?.();
                           setEditingCli(false);
                         } catch (e) {
@@ -314,7 +388,11 @@ export default function AgentDetail({
                       {savingCli ? "..." : t({ ko: "저장", en: "Save", ja: "保存", zh: "保存" })}
                     </button>
                     <button
-                      onClick={() => { setEditingCli(false); setSelectedCli(agent.cli_provider); }}
+                      onClick={() => {
+                        setEditingCli(false);
+                        setSelectedCli(agent.cli_provider);
+                        setSelectedOAuthAccountId(agent.oauth_account_id ?? "");
+                      }}
                       className="text-[10px] px-1.5 py-0.5 bg-slate-600 hover:bg-slate-500 text-slate-300 rounded transition-colors"
                     >
                       {t({ ko: "취소", en: "Cancel", ja: "キャンセル", zh: "取消" })}

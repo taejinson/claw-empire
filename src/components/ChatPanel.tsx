@@ -108,6 +108,7 @@ export function ChatPanel({
       ? selectedAgent.department.name_ko || selectedAgent.department.name
       : selectedAgent.department.name || selectedAgent.department.name_ko
     : selectedAgent?.department_id;
+  const selectedTaskId = selectedAgent?.current_task_id;
 
   // Close on Escape key
   useEffect(() => {
@@ -185,6 +186,8 @@ export function ChatPanel({
       // Show only announcements / all broadcasts when no agent selected
       return msg.receiver_type === 'all' || msg.message_type === 'announcement' || msg.message_type === 'directive';
     }
+    // Always include messages tied to the selected agent's active task.
+    if (selectedTaskId && msg.task_id === selectedTaskId) return true;
     // Show messages between CEO and selected agent
     return (
       (msg.sender_type === 'ceo' &&

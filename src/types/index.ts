@@ -29,6 +29,7 @@ export interface Agent {
   department?: Department;
   role: AgentRole;
   cli_provider: CliProvider;
+  oauth_account_id?: string | null;
   avatar_emoji: string;
   personality: string | null;
   status: AgentStatus;
@@ -234,6 +235,7 @@ export interface CompanySettings {
   companyName: string;
   ceoName: string;
   autoAssign: boolean;
+  oauthAutoSwap?: boolean;
   theme: 'dark' | 'light';
   language: UiLanguage;
   defaultProvider: CliProvider;
@@ -244,6 +246,7 @@ export const DEFAULT_SETTINGS: CompanySettings = {
   companyName: 'Claw-Empire',
   ceoName: 'CEO',
   autoAssign: true,
+  oauthAutoSwap: true,
   theme: 'dark',
   language: 'en',
   defaultProvider: 'claude',

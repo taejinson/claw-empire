@@ -167,6 +167,8 @@ export default function SettingsPanel({
   const [oauthLoading, setOauthLoading] = useState(false);
   const [disconnecting, setDisconnecting] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState<string | null>(null);
+  const [savingAccountId, setSavingAccountId] = useState<string | null>(null);
+  const [accountDrafts, setAccountDrafts] = useState<Record<string, { label: string; modelOverride: string; priority: string }>>({});
 
   // OAuth model selection state
   const [models, setModels] = useState<Record<string, string[]> | null>(null);
@@ -199,6 +201,31 @@ export default function SettingsPanel({
     [onSave]
   );
 
+  const loadOAuthStatus = useCallback(async () => {
+    setOauthLoading(true);
+    try {
+      const next = await api.getOAuthStatus();
+      setOauthStatus(next);
+      setAccountDrafts((prev) => {
+        const merged = { ...prev };
+        for (const info of Object.values(next.providers)) {
+          for (const account of info.accounts ?? []) {
+            if (!merged[account.id]) {
+              merged[account.id] = {
+                label: account.label ?? "",
+                modelOverride: account.modelOverride ?? "",
+                priority: String(account.priority ?? 100),
+              };
+            }
+          }
+        }
+        return merged;
+      });
+    } finally {
+      setOauthLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     setForm(settings as LocalSettings);
     const syncedLocale = normalizeLocale((settings as LocalSettings).language) ?? "en";
@@ -216,13 +243,9 @@ export default function SettingsPanel({
 
   useEffect(() => {
     if (tab === "oauth" && !oauthStatus) {
-      setOauthLoading(true);
-      api.getOAuthStatus()
-        .then(setOauthStatus)
-        .catch(console.error)
-        .finally(() => setOauthLoading(false));
+      loadOAuthStatus().catch(console.error);
     }
-  }, [tab, oauthStatus]);
+  }, [tab, oauthStatus, loadOAuthStatus]);
 
   // Load CLI models when cli tab is visible
   useEffect(() => {
@@ -354,8 +377,7 @@ export default function SettingsPanel({
             setDeviceStatus("complete");
             setDeviceCode(null);
             // Refresh OAuth status
-            const status = await api.getOAuthStatus();
-            setOauthStatus(status);
+            await loadOAuthStatus();
           } else if (result.status === "expired" || result.status === "denied") {
             if (pollTimerRef.current) clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -389,8 +411,7 @@ export default function SettingsPanel({
     setDisconnecting(provider);
     try {
       await api.disconnectOAuth(provider);
-      const status = await api.getOAuthStatus();
-      setOauthStatus(status);
+      await loadOAuthStatus();
       // Reset device code state if disconnecting github-copilot
       if (provider === "github-copilot") {
         setDeviceCode(null);
@@ -401,6 +422,84 @@ export default function SettingsPanel({
       console.error("Disconnect failed:", err);
     } finally {
       setDisconnecting(null);
+    }
+  }
+
+  function updateAccountDraft(accountId: string, patch: Partial<{ label: string; modelOverride: string; priority: string }>) {
+    setAccountDrafts((prev) => ({
+      ...prev,
+      [accountId]: {
+        label: prev[accountId]?.label ?? "",
+        modelOverride: prev[accountId]?.modelOverride ?? "",
+        priority: prev[accountId]?.priority ?? "100",
+        ...patch,
+      },
+    }));
+  }
+
+  async function handleActivateAccount(
+    provider: OAuthConnectProvider,
+    accountId: string,
+    currentlyActive: boolean,
+  ) {
+    setSavingAccountId(accountId);
+    try {
+      await api.activateOAuthAccount(provider, accountId, currentlyActive ? "remove" : "add");
+      await loadOAuthStatus();
+    } catch (err) {
+      console.error("Activate account failed:", err);
+    } finally {
+      setSavingAccountId(null);
+    }
+  }
+
+  async function handleSaveAccount(accountId: string) {
+    const draft = accountDrafts[accountId];
+    if (!draft) return;
+    setSavingAccountId(accountId);
+    try {
+      await api.updateOAuthAccount(accountId, {
+        label: draft.label.trim() || null,
+        model_override: draft.modelOverride.trim() || null,
+        priority: Number.isFinite(Number(draft.priority)) ? Math.max(1, Math.round(Number(draft.priority))) : 100,
+      });
+      await loadOAuthStatus();
+    } catch (err) {
+      console.error("Save account failed:", err);
+    } finally {
+      setSavingAccountId(null);
+    }
+  }
+
+  async function handleToggleAccount(accountId: string, nextStatus: "active" | "disabled") {
+    setSavingAccountId(accountId);
+    try {
+      await api.updateOAuthAccount(accountId, { status: nextStatus });
+      await loadOAuthStatus();
+    } catch (err) {
+      console.error("Toggle account failed:", err);
+    } finally {
+      setSavingAccountId(null);
+    }
+  }
+
+  async function handleDeleteAccount(provider: OAuthConnectProvider, accountId: string) {
+    if (!window.confirm(
+      t({
+        ko: "이 OAuth 계정을 삭제하시겠습니까?",
+        en: "Delete this OAuth account?",
+        ja: "この OAuth アカウントを削除しますか？",
+        zh: "要删除此 OAuth 账号吗？",
+      }),
+    )) return;
+    setSavingAccountId(accountId);
+    try {
+      await api.deleteOAuthAccount(provider, accountId);
+      await loadOAuthStatus();
+    } catch (err) {
+      console.error("Delete account failed:", err);
+    } finally {
+      setSavingAccountId(null);
     }
   }
 
@@ -500,6 +599,32 @@ export default function SettingsPanel({
             <div
               className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-all ${
                 form.autoAssign ? "left-5.5" : "left-0.5"
+              }`}
+            />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <label className="text-sm text-slate-300">
+            {t({ ko: "OAuth 자동 스왑", en: "OAuth Auto Swap", ja: "OAuth 自動スワップ", zh: "OAuth 自动切换" })}
+          </label>
+          <button
+            onClick={() =>
+              setForm({ ...form, oauthAutoSwap: !(form.oauthAutoSwap !== false) })
+            }
+            className={`w-10 h-5 rounded-full transition-colors relative ${
+              form.oauthAutoSwap !== false ? "bg-blue-500" : "bg-slate-600"
+            }`}
+            title={t({
+              ko: "실패/한도 시 다음 OAuth 계정으로 자동 전환",
+              en: "Auto-switch to next OAuth account on failures/limits",
+              ja: "失敗/上限時に次の OAuth アカウントへ自動切替",
+              zh: "失败/额度限制时自动切换到下一个 OAuth 账号",
+            })}
+          >
+            <div
+              className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-all ${
+                form.oauthAutoSwap !== false ? "left-5.5" : "left-0.5"
               }`}
             />
           </button>
@@ -836,10 +961,7 @@ export default function SettingsPanel({
             onClick={() => {
               setOauthStatus(null);
               setOauthLoading(true);
-              api.getOAuthStatus()
-                .then(setOauthStatus)
-                .catch(console.error)
-                .finally(() => setOauthLoading(false));
+              loadOAuthStatus().catch(console.error);
             }}
             className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
           >
@@ -902,23 +1024,27 @@ export default function SettingsPanel({
           <>
             {/* Connected services section */}
             {(() => {
-              const connected = Object.entries(oauthStatus.providers).filter(([, info]) => info.connected);
-              if (connected.length === 0) return null;
+              const detectedProviders = Object.entries(oauthStatus.providers).filter(
+                ([, info]) => Boolean(info.detected ?? info.connected),
+              );
+              if (detectedProviders.length === 0) return null;
               const logoMap: Record<string, ({ className }: { className?: string }) => React.ReactElement> = {
                 "github-copilot": GitHubCopilotLogo, antigravity: AntigravityLogo,
               };
               return (
                 <div className="space-y-2">
                   <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-                    {t({ ko: "연결된 서비스", en: "Connected Services", ja: "接続済みサービス", zh: "已连接服务" })}
+                    {t({ ko: "인증 상태", en: "Auth Status", ja: "認証状態", zh: "认证状态" })}
                   </div>
-                  {connected.map(([provider, info]) => {
+                  {detectedProviders.map(([provider, info]) => {
                     const oauthInfo = OAUTH_INFO[provider];
                     const LogoComp = logoMap[provider];
                     const expiresAt = info.expires_at ? new Date(info.expires_at) : null;
                     const isExpired = expiresAt ? expiresAt.getTime() < Date.now() : false;
                     const isWebOAuth = info.source === "web-oauth";
                     const isFileDetected = info.source === "file-detected";
+                    const isRunnable = Boolean(info.executionReady ?? info.connected);
+                    const accountList = info.accounts ?? [];
                     return (
                       <div key={provider} className="space-y-2 overflow-hidden rounded-lg bg-slate-700/30 p-4">
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -943,7 +1069,16 @@ export default function SettingsPanel({
                           </div>
                           <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                             {/* Status badge */}
-                            {!isExpired ? (
+                            {!isRunnable ? (
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300">
+                                {t({
+                                  ko: "감지됨 (실행 불가)",
+                                  en: "Detected (not runnable)",
+                                  ja: "検出済み（実行不可）",
+                                  zh: "已检测（不可执行）",
+                                })}
+                              </span>
+                            ) : !isExpired ? (
                               <span className="text-xs px-2 py-0.5 rounded-full bg-green-500/20 text-green-400">
                                 {info.lastRefreshed
                                   ? t({ ko: "자동 갱신됨", en: "Auto-refreshed", ja: "自動更新済", zh: "已自动刷新" })
@@ -969,8 +1104,7 @@ export default function SettingsPanel({
                                   setRefreshing(provider);
                                   try {
                                     await api.refreshOAuthToken(provider as OAuthConnectProvider);
-                                    const status = await api.getOAuthStatus();
-                                    setOauthStatus(status);
+                                    await loadOAuthStatus();
                                   } catch (err) {
                                     console.error("Manual refresh failed:", err);
                                   } finally {
@@ -1007,6 +1141,16 @@ export default function SettingsPanel({
                             )}
                           </div>
                         </div>
+                        {info.requiresWebOAuth && (
+                          <div className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded px-2.5 py-1.5">
+                            {t({
+                              ko: "CLI에서 감지된 자격 증명은 Claw-Empire 실행에 직접 사용되지 않습니다. Web OAuth로 다시 연결하세요.",
+                              en: "CLI-detected credentials are not used directly for Claw-Empire execution. Reconnect with Web OAuth.",
+                              ja: "CLI 検出の資格情報は Claw-Empire 実行では直接利用されません。Web OAuth で再接続してください。",
+                              zh: "CLI 检测到的凭据不会直接用于 Claw-Empire 执行。请使用 Web OAuth 重新连接。",
+                            })}
+                          </div>
+                        )}
                         {(info.scope || expiresAt || (info.created_at > 0)) && (
                           <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
                             {info.scope && (
@@ -1082,6 +1226,155 @@ export default function SettingsPanel({
                             </div>
                           );
                         })()}
+
+                        {accountList.length > 0 && (
+                          <div className="space-y-2 rounded-lg border border-slate-600/40 bg-slate-800/40 p-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-1.5">
+                              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                                {t({ ko: "계정 풀", en: "Account Pool", ja: "アカウントプール", zh: "账号池" })}
+                              </div>
+                              <div className="text-[10px] text-slate-500 text-right">
+                                {t({
+                                  ko: "여러 계정을 동시에 활성 가능 · 우선순위 숫자가 낮을수록 먼저 시도",
+                                  en: "Multiple active accounts supported · lower priority runs first",
+                                  ja: "複数アクティブ対応 · 優先度の数字が小さいほど先に実行",
+                                  zh: "支持多账号同时激活 · 优先级数字越小越先执行",
+                                })}
+                              </div>
+                            </div>
+                            {accountList.map((account) => {
+                              const modelKey = provider === "github-copilot" ? "copilot" : provider === "antigravity" ? "antigravity" : null;
+                              const modelList = modelKey ? (models?.[modelKey] ?? []) : [];
+                              const draft = accountDrafts[account.id] ?? {
+                                label: account.label ?? "",
+                                modelOverride: account.modelOverride ?? "",
+                                priority: String(account.priority ?? 100),
+                              };
+                              const hasCustomOverride = Boolean(draft.modelOverride) && !modelList.includes(draft.modelOverride);
+                              return (
+                                <div key={account.id} className="rounded border border-slate-700/70 bg-slate-900/30 p-2.5 space-y-2">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${account.active ? "bg-green-500/20 text-green-300" : "bg-slate-700 text-slate-400"}`}>
+                                      {account.active
+                                        ? t({ ko: "활성", en: "Active", ja: "有効", zh: "活动" })
+                                        : t({ ko: "대기", en: "Standby", ja: "待機", zh: "待命" })}
+                                    </span>
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${account.executionReady ? "bg-blue-500/20 text-blue-300" : "bg-amber-500/20 text-amber-300"}`}>
+                                      {account.executionReady
+                                        ? t({ ko: "실행 가능", en: "Runnable", ja: "実行可能", zh: "可执行" })
+                                        : t({ ko: "실행 불가", en: "Not runnable", ja: "実行不可", zh: "不可执行" })}
+                                    </span>
+                                    {account.email && (
+                                      <span className="text-[11px] text-slate-300 break-all">{account.email}</span>
+                                    )}
+                                  </div>
+
+                                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                                    <label className="space-y-1">
+                                      <span className="block text-[10px] uppercase tracking-wider text-slate-500">
+                                        {t({ ko: "라벨", en: "Label", ja: "ラベル", zh: "标签" })}
+                                      </span>
+                                      <input
+                                        value={draft.label}
+                                        onChange={(e) => updateAccountDraft(account.id, { label: e.target.value })}
+                                        placeholder={t({ ko: "계정 별칭", en: "Account alias", ja: "アカウント別名", zh: "账号别名" })}
+                                        className="w-full rounded border border-slate-600 bg-slate-800/70 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
+                                      />
+                                    </label>
+                                    <label className="space-y-1">
+                                      <span className="block text-[10px] uppercase tracking-wider text-slate-500">
+                                        {t({ ko: "모델 오버라이드", en: "Model Override", ja: "モデル上書き", zh: "模型覆盖" })}
+                                      </span>
+                                      <select
+                                        value={draft.modelOverride}
+                                        onChange={(e) => updateAccountDraft(account.id, { modelOverride: e.target.value })}
+                                        className="w-full rounded border border-slate-600 bg-slate-800/70 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
+                                      >
+                                        <option value="">
+                                          {t({
+                                            ko: "프로바이더 기본값 사용",
+                                            en: "Use provider default",
+                                            ja: "プロバイダ既定値を使用",
+                                            zh: "使用提供方默认值",
+                                          })}
+                                        </option>
+                                        {hasCustomOverride && (
+                                          <option value={draft.modelOverride}>
+                                            {draft.modelOverride}
+                                          </option>
+                                        )}
+                                        {modelList.map((m) => (
+                                          <option key={m} value={m}>
+                                            {m}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                    <label className="space-y-1">
+                                      <span className="block text-[10px] uppercase tracking-wider text-slate-500">
+                                        {t({ ko: "우선순위", en: "Priority", ja: "優先度", zh: "优先级" })}
+                                      </span>
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        step={1}
+                                        value={draft.priority}
+                                        onChange={(e) => updateAccountDraft(account.id, { priority: e.target.value })}
+                                        placeholder="100"
+                                        className="w-full rounded border border-slate-600 bg-slate-800/70 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
+                                      />
+                                    </label>
+                                  </div>
+
+                                  <div className="flex flex-wrap gap-1.5">
+                                    <button
+                                      onClick={() => handleActivateAccount(provider as OAuthConnectProvider, account.id, account.active)}
+                                      disabled={savingAccountId === account.id || account.status !== "active"}
+                                      className={`text-[11px] px-2 py-1 rounded disabled:opacity-50 ${
+                                        account.active
+                                          ? "bg-orange-600/20 hover:bg-orange-600/35 text-orange-200"
+                                          : "bg-blue-600/30 hover:bg-blue-600/45 text-blue-200"
+                                      }`}
+                                    >
+                                      {account.active
+                                        ? t({ ko: "풀 해제", en: "Pool Off", ja: "プール解除", zh: "移出池" })
+                                        : t({ ko: "풀 추가", en: "Pool On", ja: "プール追加", zh: "加入池" })}
+                                    </button>
+                                    <button
+                                      onClick={() => handleSaveAccount(account.id)}
+                                      disabled={savingAccountId === account.id}
+                                      className="text-[11px] px-2 py-1 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 disabled:opacity-50"
+                                    >
+                                      {t({ ko: "저장", en: "Save", ja: "保存", zh: "保存" })}
+                                    </button>
+                                    <button
+                                      onClick={() => handleToggleAccount(account.id, account.status === "active" ? "disabled" : "active")}
+                                      disabled={savingAccountId === account.id}
+                                      className="text-[11px] px-2 py-1 rounded bg-amber-600/20 hover:bg-amber-600/35 text-amber-200 disabled:opacity-50"
+                                    >
+                                      {account.status === "active"
+                                        ? t({ ko: "비활성", en: "Disable", ja: "無効化", zh: "禁用" })
+                                        : t({ ko: "활성화", en: "Enable", ja: "有効化", zh: "启用" })}
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeleteAccount(provider as OAuthConnectProvider, account.id)}
+                                      disabled={savingAccountId === account.id}
+                                      className="text-[11px] px-2 py-1 rounded bg-red-600/20 hover:bg-red-600/35 text-red-300 disabled:opacity-50"
+                                    >
+                                      {t({ ko: "삭제", en: "Delete", ja: "削除", zh: "删除" })}
+                                    </button>
+                                  </div>
+
+                                  {account.lastError && (
+                                    <div className="text-[10px] text-red-300 break-words">
+                                      {account.lastError}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1092,12 +1385,13 @@ export default function SettingsPanel({
             {/* New OAuth Connect section — provider cards */}
             <div className="space-y-3">
               <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                {t({ ko: "새 OAuth 연결", en: "New OAuth Connection", ja: "新しい OAuth 接続", zh: "新 OAuth 连接" })}
+                {t({ ko: "OAuth 계정 추가", en: "Add OAuth Account", ja: "OAuth アカウント追加", zh: "添加 OAuth 账号" })}
               </div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {CONNECTABLE_PROVIDERS.map(({ id, label, Logo, description }) => {
                   const providerInfo = oauthStatus.providers[id];
-                  const isConnected = providerInfo?.connected;
+                  const isConnected = Boolean(providerInfo?.executionReady ?? providerInfo?.connected);
+                  const isDetectedOnly = Boolean(providerInfo?.detected) && !isConnected;
                   const storageOk = oauthStatus.storageReady;
                   const isGitHub = id === "github-copilot";
 
@@ -1107,6 +1401,8 @@ export default function SettingsPanel({
                       className={`flex flex-col items-center gap-2 p-4 rounded-xl border transition-all ${
                         isConnected
                           ? "bg-green-500/5 border-green-500/30"
+                          : isDetectedOnly
+                          ? "bg-amber-500/5 border-amber-500/30"
                           : storageOk
                           ? "bg-slate-700/30 border-slate-600/50 hover:border-blue-400/50 hover:bg-slate-700/50"
                           : "bg-slate-800/30 border-slate-700/30 opacity-50"
@@ -1115,41 +1411,54 @@ export default function SettingsPanel({
                       <Logo className="w-8 h-8" />
                       <span className="text-sm font-medium text-white">{label}</span>
                       <span className="text-[10px] text-slate-400 text-center leading-tight">{description}</span>
-                      {isConnected ? (
-                        <span className="text-[11px] px-2.5 py-1 rounded-lg bg-green-500/20 text-green-400 font-medium">
-                          {t({ ko: "연결됨", en: "Connected", ja: "接続済み", zh: "已连接" })}
-                        </span>
-                      ) : !storageOk ? (
+                      {!storageOk ? (
                         <span className="text-[10px] px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
                           {t({ ko: "암호화 키 필요", en: "Encryption key required", ja: "暗号化キーが必要", zh: "需要加密密钥" })}
                         </span>
-                      ) : isGitHub ? (
-                        /* GitHub Copilot: Device Code flow */
-                        deviceCode && deviceStatus === "polling" ? (
-                          <div className="flex flex-col items-center gap-1.5">
-                            <div className="text-xs text-slate-300 font-mono bg-slate-700/60 px-3 py-1.5 rounded-lg tracking-widest select-all">
-                              {deviceCode.userCode}
-                            </div>
-                            <span className="text-[10px] text-blue-400 animate-pulse">
-                              {t({ ko: "코드 입력 대기 중...", en: "Waiting for code...", ja: "コード入力待機中...", zh: "等待输入代码..." })}
-                            </span>
-                          </div>
-                        ) : (
-                          <button
-                            onClick={startDeviceCodeFlow}
-                            className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
-                          >
-                            {t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
-                          </button>
-                        )
                       ) : (
-                        /* Antigravity: Web redirect OAuth */
-                        <button
-                          onClick={() => handleConnect(id)}
-                          className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
-                        >
-                          {t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
-                        </button>
+                        <>
+                          {isConnected ? (
+                            <span className="text-[11px] px-2.5 py-1 rounded-lg bg-green-500/20 text-green-400 font-medium">
+                              {t({ ko: "실행 가능", en: "Runnable", ja: "実行可能", zh: "可执行" })}
+                            </span>
+                          ) : isDetectedOnly ? (
+                            <span className="text-[11px] px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 font-medium">
+                              {t({ ko: "감지됨", en: "Detected", ja: "検出済み", zh: "已检测" })}
+                            </span>
+                          ) : null}
+                          {isGitHub ? (
+                            /* GitHub Copilot: Device Code flow */
+                            deviceCode && deviceStatus === "polling" ? (
+                              <div className="flex flex-col items-center gap-1.5">
+                                <div className="text-xs text-slate-300 font-mono bg-slate-700/60 px-3 py-1.5 rounded-lg tracking-widest select-all">
+                                  {deviceCode.userCode}
+                                </div>
+                                <span className="text-[10px] text-blue-400 animate-pulse">
+                                  {t({ ko: "코드 입력 대기 중...", en: "Waiting for code...", ja: "コード入力待機中...", zh: "等待输入代码..." })}
+                                </span>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={startDeviceCodeFlow}
+                                className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
+                              >
+                                {isConnected || isDetectedOnly
+                                  ? t({ ko: "계정 추가", en: "Add Account", ja: "アカウント追加", zh: "添加账号" })
+                                  : t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
+                              </button>
+                            )
+                          ) : (
+                            /* Antigravity: Web redirect OAuth */
+                            <button
+                              onClick={() => handleConnect(id)}
+                              className="text-[11px] px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
+                            >
+                              {isConnected || isDetectedOnly
+                                ? t({ ko: "계정 추가", en: "Add Account", ja: "アカウント追加", zh: "添加账号" })
+                                : t({ ko: "연결하기", en: "Connect", ja: "接続", zh: "连接" })}
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
                   );

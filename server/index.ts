@@ -422,6 +422,7 @@ CREATE TABLE IF NOT EXISTS agents (
   department_id TEXT REFERENCES departments(id),
   role TEXT NOT NULL CHECK(role IN ('team_leader','senior','junior','intern')),
   cli_provider TEXT CHECK(cli_provider IN ('claude','codex','gemini','opencode','copilot','antigravity')),
+  oauth_account_id TEXT,
   avatar_emoji TEXT NOT NULL DEFAULT '🤖',
   personality TEXT,
   status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle','working','break','offline')),
@@ -509,6 +510,34 @@ CREATE TABLE IF NOT EXISTS oauth_credentials (
   updated_at INTEGER DEFAULT (unixepoch()*1000)
 );
 
+CREATE TABLE IF NOT EXISTS oauth_accounts (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('github','google_antigravity')),
+  source TEXT,
+  label TEXT,
+  email TEXT,
+  scope TEXT,
+  expires_at INTEGER,
+  access_token_enc TEXT,
+  refresh_token_enc TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  priority INTEGER NOT NULL DEFAULT 100,
+  model_override TEXT,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_error_at INTEGER,
+  last_success_at INTEGER,
+  created_at INTEGER DEFAULT (unixepoch()*1000),
+  updated_at INTEGER DEFAULT (unixepoch()*1000)
+);
+
+CREATE TABLE IF NOT EXISTS oauth_active_accounts (
+  provider TEXT NOT NULL,
+  account_id TEXT NOT NULL REFERENCES oauth_accounts(id) ON DELETE CASCADE,
+  updated_at INTEGER DEFAULT (unixepoch()*1000),
+  PRIMARY KEY (provider, account_id)
+);
+
 CREATE TABLE IF NOT EXISTS oauth_states (
   id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
@@ -545,11 +574,180 @@ CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, created_at D
 CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_type, receiver_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meeting_minutes_task ON meeting_minutes(task_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meeting_minute_entries_meeting ON meeting_minute_entries(meeting_id, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider, status, priority, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oauth_active_accounts_provider ON oauth_active_accounts(provider, updated_at DESC);
 `);
 
 // Add columns to oauth_credentials for web-oauth tokens (safe to run repeatedly)
 try { db.exec("ALTER TABLE oauth_credentials ADD COLUMN access_token_enc TEXT"); } catch { /* already exists */ }
 try { db.exec("ALTER TABLE oauth_credentials ADD COLUMN refresh_token_enc TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE agents ADD COLUMN oauth_account_id TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN label TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN model_override TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN last_error TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN last_error_at INTEGER"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_accounts ADD COLUMN last_success_at INTEGER"); } catch { /* already exists */ }
+
+function migrateOAuthActiveAccountsTable(): void {
+  const cols = db.prepare("PRAGMA table_info(oauth_active_accounts)").all() as Array<{
+    name: string;
+    pk: number;
+  }>;
+  if (cols.length === 0) return;
+  const providerPk = cols.find((c) => c.name === "provider")?.pk ?? 0;
+  const accountPk = cols.find((c) => c.name === "account_id")?.pk ?? 0;
+  const hasCompositePk = providerPk === 1 && accountPk === 2;
+  if (hasCompositePk) return;
+
+  db.exec("BEGIN");
+  try {
+    db.exec("ALTER TABLE oauth_active_accounts RENAME TO oauth_active_accounts_legacy");
+    db.exec(`
+      CREATE TABLE oauth_active_accounts (
+        provider TEXT NOT NULL,
+        account_id TEXT NOT NULL REFERENCES oauth_accounts(id) ON DELETE CASCADE,
+        updated_at INTEGER DEFAULT (unixepoch()*1000),
+        PRIMARY KEY (provider, account_id)
+      )
+    `);
+    db.exec(`
+      INSERT OR IGNORE INTO oauth_active_accounts (provider, account_id, updated_at)
+      SELECT provider, account_id, COALESCE(updated_at, unixepoch() * 1000)
+      FROM oauth_active_accounts_legacy
+      WHERE provider IS NOT NULL AND account_id IS NOT NULL
+    `);
+    db.exec("DROP TABLE oauth_active_accounts_legacy");
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+migrateOAuthActiveAccountsTable();
+
+function getActiveOAuthAccountIds(provider: string): string[] {
+  return (db.prepare(`
+    SELECT oa.account_id
+    FROM oauth_active_accounts oa
+    JOIN oauth_accounts a ON a.id = oa.account_id
+    WHERE oa.provider = ?
+      AND a.provider = ?
+      AND a.status = 'active'
+    ORDER BY oa.updated_at DESC, a.priority ASC, a.updated_at DESC
+  `).all(provider, provider) as Array<{ account_id: string }>).map((r) => r.account_id);
+}
+
+function setActiveOAuthAccount(provider: string, accountId: string): void {
+  db.prepare(`
+    INSERT INTO oauth_active_accounts (provider, account_id, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(provider, account_id) DO UPDATE SET
+      updated_at = excluded.updated_at
+  `).run(provider, accountId, nowMs());
+}
+
+function removeActiveOAuthAccount(provider: string, accountId: string): void {
+  db.prepare(
+    "DELETE FROM oauth_active_accounts WHERE provider = ? AND account_id = ?"
+  ).run(provider, accountId);
+}
+
+function setOAuthActiveAccounts(provider: string, accountIds: string[]): void {
+  const cleaned = Array.from(new Set(accountIds.filter(Boolean)));
+  const run = db.transaction((ids: string[]) => {
+    db.prepare("DELETE FROM oauth_active_accounts WHERE provider = ?").run(provider);
+    if (ids.length === 0) return;
+    const stmt = db.prepare(`
+      INSERT INTO oauth_active_accounts (provider, account_id, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(provider, account_id) DO UPDATE SET
+        updated_at = excluded.updated_at
+    `);
+    let stamp = nowMs();
+    for (const id of ids) {
+      stmt.run(provider, id, stamp);
+      stamp += 1;
+    }
+  });
+  run(cleaned);
+}
+
+function ensureOAuthActiveAccount(provider: string): void {
+  db.prepare(`
+    DELETE FROM oauth_active_accounts
+    WHERE provider = ?
+      AND account_id NOT IN (
+        SELECT id FROM oauth_accounts WHERE provider = ? AND status = 'active'
+      )
+  `).run(provider, provider);
+
+  const activeIds = getActiveOAuthAccountIds(provider);
+  if (activeIds.length > 0) return;
+
+  const fallback = db.prepare(
+    "SELECT id FROM oauth_accounts WHERE provider = ? AND status = 'active' ORDER BY priority ASC, updated_at DESC LIMIT 1"
+  ).get(provider) as { id: string } | undefined;
+  if (!fallback) {
+    db.prepare("DELETE FROM oauth_active_accounts WHERE provider = ?").run(provider);
+    return;
+  }
+  setActiveOAuthAccount(provider, fallback.id);
+}
+
+function migrateLegacyOAuthCredentialsToAccounts(): void {
+  const legacyRows = db.prepare(`
+    SELECT provider, source, email, scope, expires_at, access_token_enc, refresh_token_enc, created_at, updated_at
+    FROM oauth_credentials
+    WHERE provider IN ('github','google_antigravity')
+  `).all() as Array<{
+    provider: string;
+    source: string | null;
+    email: string | null;
+    scope: string | null;
+    expires_at: number | null;
+    access_token_enc: string | null;
+    refresh_token_enc: string | null;
+    created_at: number;
+    updated_at: number;
+  }>;
+
+  for (const row of legacyRows) {
+    const hasAccounts = db.prepare(
+      "SELECT COUNT(*) as cnt FROM oauth_accounts WHERE provider = ?"
+    ).get(row.provider) as { cnt: number };
+    if (hasAccounts.cnt > 0) continue;
+    if (!row.access_token_enc && !row.refresh_token_enc) continue;
+    const id = randomUUID();
+    const label = getNextOAuthLabel(row.provider);
+    db.prepare(`
+      INSERT INTO oauth_accounts (
+        id, provider, source, label, email, scope, expires_at,
+        access_token_enc, refresh_token_enc, status, priority,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 100, ?, ?)
+    `).run(
+      id,
+      row.provider,
+      row.source,
+      label,
+      row.email,
+      row.scope,
+      row.expires_at,
+      row.access_token_enc,
+      row.refresh_token_enc,
+      row.created_at || nowMs(),
+      row.updated_at || nowMs(),
+    );
+  }
+
+  ensureOAuthActiveAccount("github");
+  ensureOAuthActiveAccount("google_antigravity");
+}
+migrateLegacyOAuthCredentialsToAccounts();
 
 // Subtask cross-department delegation columns
 try { db.exec("ALTER TABLE subtasks ADD COLUMN target_department_id TEXT"); } catch { /* already exists */ }
@@ -900,6 +1098,7 @@ if (agentCount === 0) {
     insertSetting.run("companyName", "Claw-Empire");
     insertSetting.run("ceoName", "CEO");
     insertSetting.run("autoAssign", "true");
+    insertSetting.run("oauthAutoSwap", "true");
     insertSetting.run("language", "en");
     insertSetting.run("defaultProvider", "claude");
     insertSetting.run("providerModelConfig", JSON.stringify({
@@ -919,6 +1118,14 @@ if (agentCount === 0) {
   if (!hasLanguageSetting) {
     db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)")
       .run("language", "en");
+  }
+
+  const hasOAuthAutoSwapSetting = db
+    .prepare("SELECT 1 FROM settings WHERE key = 'oauthAutoSwap' LIMIT 1")
+    .get() as { 1: number } | undefined;
+  if (!hasOAuthAutoSwapSetting) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)")
+      .run("oauthAutoSwap", "true");
   }
 }
 
@@ -1191,7 +1398,6 @@ function buildAgentArgs(provider: string, model?: string, reasoningLevel?: strin
         "claude",
         "--dangerously-skip-permissions",
         "--print",
-        "--verbose",
         "--output-format=stream-json",
         "--include-partial-messages",
       ];
@@ -1216,6 +1422,39 @@ function buildAgentArgs(provider: string, model?: string, reasoningLevel?: strin
     default:
       throw new Error(`unsupported CLI provider: ${provider}`);
   }
+}
+
+const ANSI_ESCAPE_REGEX = /\u001b(?:\[[0-?]*[ -/]*[@-~]|][^\u0007]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
+const CLI_SPINNER_LINE_REGEX = /^[\s.·•◦○●◌◍◐◓◑◒◉◎|/\\\-⠁-⣿]+$/u;
+
+function normalizeStreamChunk(
+  raw: Buffer | string,
+  opts: { dropCliNoise?: boolean } = {},
+): string {
+  const { dropCliNoise = false } = opts;
+  const input = typeof raw === "string" ? raw : raw.toString("utf8");
+  const normalized = input
+    .replace(ANSI_ESCAPE_REGEX, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  if (!dropCliNoise) return normalized;
+
+  return normalized
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (/^reading prompt from stdin\.{0,3}$/i.test(trimmed)) return false;
+      if (CLI_SPINNER_LINE_REGEX.test(trimmed)) return false;
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function hasStructuredJsonLines(raw: string): boolean {
+  return raw.split(/\r?\n/).some((line) => line.trim().startsWith("{"));
 }
 
 /** Fetch recent conversation context for an agent to include in spawn prompt */
@@ -1518,7 +1757,10 @@ async function runAgentOneShot(
   let exitCode = 0;
 
   const onChunk = (chunk: Buffer | string, stream: "stdout" | "stderr") => {
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const text = normalizeStreamChunk(chunk, {
+      dropCliNoise: provider !== "copilot" && provider !== "antigravity",
+    });
+    if (!text) return;
     rawOutput += text;
     logStream.write(text);
     if (streamTaskId) {
@@ -1532,9 +1774,22 @@ async function runAgentOneShot(
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       try {
         if (provider === "copilot") {
-          await executeCopilotAgent(prompt, projectPath, logStream, controller.signal, streamTaskId ?? undefined);
+          await executeCopilotAgent(
+            prompt,
+            projectPath,
+            logStream,
+            controller.signal,
+            streamTaskId ?? undefined,
+            agent.oauth_account_id ?? null,
+          );
         } else {
-          await executeAntigravityAgent(prompt, logStream, controller.signal, streamTaskId ?? undefined);
+          await executeAntigravityAgent(
+            prompt,
+            logStream,
+            controller.signal,
+            streamTaskId ?? undefined,
+            agent.oauth_account_id ?? null,
+          );
         }
       } finally {
         clearTimeout(timeout);
@@ -1552,6 +1807,10 @@ async function runAgentOneShot(
         const cleanEnv = { ...process.env };
         delete cleanEnv.CLAUDECODE;
         delete cleanEnv.CLAUDE_CODE;
+        cleanEnv.NO_COLOR = "1";
+        cleanEnv.FORCE_COLOR = "0";
+        cleanEnv.CI = "1";
+        if (!cleanEnv.TERM) cleanEnv.TERM = "dumb";
 
         const child = spawn(args[0], args.slice(1), {
           cwd: projectPath,
@@ -1589,7 +1848,9 @@ async function runAgentOneShot(
     onChunk(`\n[one-shot-error] ${message}\n`, "stderr");
     const partial = normalizeConversationReply(rawOutput, 320);
     if (partial) return { text: partial, error: message };
-    const rough = (prettyStreamJson(rawOutput).trim() ? prettyStreamJson(rawOutput) : rawOutput)
+    const pretty = prettyStreamJson(rawOutput);
+    const roughSource = (pretty.trim() || hasStructuredJsonLines(rawOutput)) ? pretty : rawOutput;
+    const rough = roughSource
       .replace(/\s+/g, " ")
       .trim();
     if (rough) {
@@ -1608,7 +1869,9 @@ async function runAgentOneShot(
   const normalized = normalizeConversationReply(rawOutput);
   if (normalized) return { text: normalized };
 
-  const rough = (prettyStreamJson(rawOutput).trim() ? prettyStreamJson(rawOutput) : rawOutput)
+  const pretty = prettyStreamJson(rawOutput);
+  const roughSource = (pretty.trim() || hasStructuredJsonLines(rawOutput)) ? pretty : rawOutput;
+  const rough = roughSource
     .replace(/\s+/g, " ")
     .trim();
   if (rough) {
@@ -2122,6 +2385,10 @@ function spawnCliAgent(
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
   delete cleanEnv.CLAUDE_CODE;
+  cleanEnv.NO_COLOR = "1";
+  cleanEnv.FORCE_COLOR = "0";
+  cleanEnv.CI = "1";
+  if (!cleanEnv.TERM) cleanEnv.TERM = "dumb";
 
   const child = spawn(args[0], args.slice(1), {
     cwd: projectPath,
@@ -2196,15 +2463,18 @@ function spawnCliAgent(
   // Pipe agent output to log file AND broadcast via WebSocket
   child.stdout?.on("data", (chunk: Buffer) => {
     touchIdleTimer();
-    logStream.write(chunk);
-    const text = chunk.toString("utf8");
+    const text = normalizeStreamChunk(chunk, { dropCliNoise: true });
+    if (!text) return;
+    logStream.write(text);
     broadcast("cli_output", { task_id: taskId, stream: "stdout", data: text });
     parseAndCreateSubtasks(taskId, text);
   });
   child.stderr?.on("data", (chunk: Buffer) => {
     touchIdleTimer();
-    logStream.write(chunk);
-    broadcast("cli_output", { task_id: taskId, stream: "stderr", data: chunk.toString("utf8") });
+    const text = normalizeStreamChunk(chunk, { dropCliNoise: true });
+    if (!text) return;
+    logStream.write(text);
+    broadcast("cli_output", { task_id: taskId, stream: "stderr", data: text });
   });
 
   child.on("close", () => {
@@ -2235,18 +2505,200 @@ let cachedModels: { data: Record<string, string[]>; loadedAt: number } | null = 
 const MODELS_CACHE_TTL = 60_000;
 
 interface DecryptedOAuthToken {
+  id: string | null;
+  provider: string;
+  source: string | null;
+  label: string | null;
   accessToken: string | null;
   refreshToken: string | null;
   expiresAt: number | null;
   email: string | null;
+  status?: string;
+  priority?: number;
+  modelOverride?: string | null;
+  failureCount?: number;
+  lastError?: string | null;
+  lastErrorAt?: number | null;
+  lastSuccessAt?: number | null;
+}
+
+function oauthProviderPrefix(provider: string): string {
+  return provider === "github" ? "Copi" : "Anti";
+}
+
+function normalizeOAuthProvider(provider: string): "github" | "google_antigravity" | null {
+  if (provider === "github-copilot" || provider === "github" || provider === "copilot") return "github";
+  if (provider === "antigravity" || provider === "google_antigravity") return "google_antigravity";
+  return null;
+}
+
+function getOAuthAccountDisplayName(account: DecryptedOAuthToken): string {
+  if (account.label) return account.label;
+  if (account.email) return account.email;
+  const prefix = oauthProviderPrefix(account.provider);
+  return `${prefix}-${(account.id ?? "unknown").slice(0, 6)}`;
+}
+
+function getNextOAuthLabel(provider: string): string {
+  const normalizedProvider = normalizeOAuthProvider(provider) ?? provider;
+  const prefix = oauthProviderPrefix(normalizedProvider);
+  const rows = db.prepare(
+    "SELECT label FROM oauth_accounts WHERE provider = ?"
+  ).all(normalizedProvider) as Array<{ label: string | null }>;
+  let maxSeq = 0;
+  for (const row of rows) {
+    if (!row.label) continue;
+    const m = row.label.match(new RegExp(`^${prefix}-(\\d+)$`));
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
+  }
+  return `${prefix}-${maxSeq + 1}`;
+}
+
+function getOAuthAutoSwapEnabled(): boolean {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'oauthAutoSwap'").get() as { value: string } | undefined;
+  if (!row) return true;
+  const v = String(row.value).toLowerCase().trim();
+  return !(v === "false" || v === "0" || v === "off" || v === "no");
+}
+
+const oauthDispatchCursor = new Map<string, number>();
+
+function rotateOAuthAccounts(provider: string, accounts: DecryptedOAuthToken[]): DecryptedOAuthToken[] {
+  if (accounts.length <= 1) return accounts;
+  const current = oauthDispatchCursor.get(provider) ?? -1;
+  const next = (current + 1) % accounts.length;
+  oauthDispatchCursor.set(provider, next);
+  if (next === 0) return accounts;
+  return [...accounts.slice(next), ...accounts.slice(0, next)];
+}
+
+function prioritizeOAuthAccount(
+  accounts: DecryptedOAuthToken[],
+  preferredAccountId?: string | null,
+): DecryptedOAuthToken[] {
+  if (!preferredAccountId || accounts.length <= 1) return accounts;
+  const idx = accounts.findIndex((a) => a.id === preferredAccountId);
+  if (idx <= 0) return accounts;
+  const [picked] = accounts.splice(idx, 1);
+  return [picked, ...accounts];
+}
+
+function markOAuthAccountFailure(accountId: string, message: string): void {
+  db.prepare(`
+    UPDATE oauth_accounts
+    SET failure_count = COALESCE(failure_count, 0) + 1,
+        last_error = ?,
+        last_error_at = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(message.slice(0, 1500), nowMs(), nowMs(), accountId);
+}
+
+function markOAuthAccountSuccess(accountId: string): void {
+  db.prepare(`
+    UPDATE oauth_accounts
+    SET failure_count = 0,
+        last_error = NULL,
+        last_error_at = NULL,
+        last_success_at = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(nowMs(), nowMs(), accountId);
+}
+
+function getOAuthAccounts(provider: string, includeDisabled = false): DecryptedOAuthToken[] {
+  const normalizedProvider = normalizeOAuthProvider(provider);
+  if (!normalizedProvider) return [];
+  const rows = db.prepare(`
+    SELECT
+      id, provider, source, label, email, scope, expires_at,
+      access_token_enc, refresh_token_enc, status, priority,
+      model_override, failure_count, last_error, last_error_at, last_success_at
+    FROM oauth_accounts
+    WHERE provider = ?
+      ${includeDisabled ? "" : "AND status = 'active'"}
+    ORDER BY priority ASC, updated_at DESC
+  `).all(normalizedProvider) as Array<{
+    id: string;
+    provider: string;
+    source: string | null;
+    label: string | null;
+    email: string | null;
+    scope: string | null;
+    expires_at: number | null;
+    access_token_enc: string | null;
+    refresh_token_enc: string | null;
+    status: string;
+    priority: number;
+    model_override: string | null;
+    failure_count: number;
+    last_error: string | null;
+    last_error_at: number | null;
+    last_success_at: number | null;
+  }>;
+
+  const accounts: DecryptedOAuthToken[] = [];
+  for (const row of rows) {
+    try {
+      accounts.push({
+        id: row.id,
+        provider: row.provider,
+        source: row.source,
+        label: row.label,
+        accessToken: row.access_token_enc ? decryptSecret(row.access_token_enc) : null,
+        refreshToken: row.refresh_token_enc ? decryptSecret(row.refresh_token_enc) : null,
+        expiresAt: row.expires_at,
+        email: row.email,
+        status: row.status,
+        priority: row.priority,
+        modelOverride: row.model_override,
+        failureCount: row.failure_count,
+        lastError: row.last_error,
+        lastErrorAt: row.last_error_at,
+        lastSuccessAt: row.last_success_at,
+      });
+    } catch {
+      // skip undecryptable account
+    }
+  }
+  return accounts;
+}
+
+function getPreferredOAuthAccounts(
+  provider: string,
+  opts: { includeStandby?: boolean } = {},
+): DecryptedOAuthToken[] {
+  const normalizedProvider = normalizeOAuthProvider(provider);
+  if (!normalizedProvider) return [];
+  ensureOAuthActiveAccount(normalizedProvider);
+  const accounts = getOAuthAccounts(normalizedProvider, false);
+  if (accounts.length === 0) return [];
+  const activeIds = getActiveOAuthAccountIds(normalizedProvider);
+  if (activeIds.length === 0) return accounts;
+  const activeSet = new Set(activeIds);
+  const selected = accounts.filter((a) => a.id && activeSet.has(a.id));
+  if (selected.length === 0) return accounts;
+  if (!opts.includeStandby) return selected;
+  const standby = accounts.filter((a) => !(a.id && activeSet.has(a.id)));
+  return [...selected, ...standby];
 }
 
 function getDecryptedOAuthToken(provider: string): DecryptedOAuthToken | null {
+  const preferred = getPreferredOAuthAccounts(provider)[0];
+  if (preferred) return preferred;
+
+  // Legacy fallback for existing installations before oauth_accounts migration.
   const row = db
     .prepare("SELECT access_token_enc, refresh_token_enc, expires_at, email FROM oauth_credentials WHERE provider = ?")
     .get(provider) as { access_token_enc: string | null; refresh_token_enc: string | null; expires_at: number | null; email: string | null } | undefined;
   if (!row) return null;
   return {
+    id: null,
+    provider,
+    source: "legacy",
+    label: null,
     accessToken: row.access_token_enc ? decryptSecret(row.access_token_enc) : null,
     refreshToken: row.refresh_token_enc ? decryptSecret(row.refresh_token_enc) : null,
     expiresAt: row.expires_at,
@@ -2290,6 +2742,13 @@ async function refreshGoogleToken(credential: DecryptedOAuthToken): Promise<stri
   // Update DB with new access token
   const now = nowMs();
   const accessEnc = encryptSecret(data.access_token);
+  if (credential.id) {
+    db.prepare(`
+      UPDATE oauth_accounts
+      SET access_token_enc = ?, expires_at = ?, updated_at = ?, last_success_at = ?, last_error = NULL, last_error_at = NULL
+      WHERE id = ?
+    `).run(accessEnc, newExpiresAt, now, now, credential.id);
+  }
   db.prepare(
     "UPDATE oauth_credentials SET access_token_enc = ?, expires_at = ?, updated_at = ? WHERE provider = 'google_antigravity'"
   ).run(accessEnc, newExpiresAt, now);
@@ -2425,10 +2884,12 @@ async function parseSSEStream(
       const data = JSON.parse(trimmed.slice(6));
       const delta = data.choices?.[0]?.delta;
       if (delta?.content) {
-        logStream.write(delta.content);
+        const text = normalizeStreamChunk(delta.content);
+        if (!text) return;
+        logStream.write(text);
         if (taskId) {
-          broadcast("cli_output", { task_id: taskId, stream: "stdout", data: delta.content });
-          parseHttpAgentSubtasks(taskId, delta.content, subtaskAccum);
+          broadcast("cli_output", { task_id: taskId, stream: "stdout", data: text });
+          parseHttpAgentSubtasks(taskId, text, subtaskAccum);
         }
       }
     } catch { /* ignore */ }
@@ -2467,10 +2928,12 @@ async function parseGeminiSSEStream(
           if (Array.isArray(parts)) {
             for (const part of parts) {
               if (part.text) {
-                logStream.write(part.text);
+                const text = normalizeStreamChunk(part.text);
+                if (!text) continue;
+                logStream.write(text);
                 if (taskId) {
-                  broadcast("cli_output", { task_id: taskId, stream: "stdout", data: part.text });
-                  parseHttpAgentSubtasks(taskId, part.text, subtaskAccum);
+                  broadcast("cli_output", { task_id: taskId, stream: "stdout", data: text });
+                  parseHttpAgentSubtasks(taskId, text, subtaskAccum);
                 }
               }
             }
@@ -2490,53 +2953,113 @@ async function parseGeminiSSEStream(
   if (buffer.trim()) processLine(buffer.trim());
 }
 
+function resolveCopilotModel(rawModel: string): string {
+  return rawModel.includes("/") ? rawModel.split("/").pop()! : rawModel;
+}
+
+function resolveAntigravityModel(rawModel: string): string {
+  let model = rawModel;
+  if (model.includes("antigravity-")) {
+    model = model.slice(model.indexOf("antigravity-") + "antigravity-".length);
+  } else if (model.includes("/")) {
+    model = model.split("/").pop()!;
+  }
+  return model;
+}
+
 async function executeCopilotAgent(
   prompt: string,
   projectPath: string,
   logStream: fs.WriteStream,
   signal: AbortSignal,
   taskId?: string,
+  preferredAccountId?: string | null,
 ): Promise<void> {
   const modelConfig = getProviderModelConfig();
-  const rawModel = modelConfig.copilot?.model || "github-copilot/gpt-4o";
-  const model = rawModel.includes("/") ? rawModel.split("/").pop()! : rawModel;
-
-  const cred = getDecryptedOAuthToken("github");
-  if (!cred?.accessToken) throw new Error("No GitHub OAuth token found. Connect GitHub Copilot first.");
-
-  logStream.write(`[copilot] Exchanging Copilot token...\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[copilot] Exchanging Copilot token...\n" });
-  const { token, baseUrl } = await exchangeCopilotToken(cred.accessToken);
-  logStream.write(`[copilot] Model: ${model}, Base: ${baseUrl}\n---\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: `[copilot] Model: ${model}, Base: ${baseUrl}\n---\n` });
-
-  const resp = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "Editor-Version": "climpire/1.0.0",
-      "Copilot-Integration-Id": "vscode-chat",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: `You are a coding assistant. Project path: ${projectPath}` },
-        { role: "user", content: prompt },
-      ],
-      stream: true,
-    }),
-    signal,
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Copilot API error (${resp.status}): ${text}`);
+  const defaultRawModel = modelConfig.copilot?.model || "github-copilot/gpt-4o";
+  const autoSwap = getOAuthAutoSwapEnabled();
+  const preferred = getPreferredOAuthAccounts("github").filter((a) => Boolean(a.accessToken));
+  const baseAccounts = prioritizeOAuthAccount(preferred, preferredAccountId);
+  const hasPinnedAccount = Boolean(preferredAccountId) && baseAccounts.some((a) => a.id === preferredAccountId);
+  const accounts = hasPinnedAccount ? baseAccounts : rotateOAuthAccounts("github", baseAccounts);
+  if (accounts.length === 0) {
+    throw new Error("No GitHub OAuth token found. Connect GitHub Copilot first.");
   }
 
-  await parseSSEStream(resp.body!, logStream, signal, taskId);
-  logStream.write(`\n---\n[copilot] Done.\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "\n---\n[copilot] Done.\n" });
+  const maxAttempts = autoSwap ? accounts.length : Math.min(accounts.length, 1);
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < maxAttempts; i += 1) {
+    const account = accounts[i];
+    if (!account.accessToken) continue;
+    const accountName = getOAuthAccountDisplayName(account);
+    const rawModel = account.modelOverride || defaultRawModel;
+    const model = resolveCopilotModel(rawModel);
+
+    const header = `[copilot] Account: ${accountName}${account.modelOverride ? ` (model override: ${rawModel})` : ""}\n`;
+    logStream.write(header);
+    if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: header });
+
+    try {
+      logStream.write("[copilot] Exchanging Copilot token...\n");
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[copilot] Exchanging Copilot token...\n" });
+      const { token, baseUrl } = await exchangeCopilotToken(account.accessToken);
+      logStream.write(`[copilot] Model: ${model}, Base: ${baseUrl}\n---\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: `[copilot] Model: ${model}, Base: ${baseUrl}\n---\n` });
+
+      const resp = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Editor-Version": "climpire/1.0.0",
+          "Copilot-Integration-Id": "vscode-chat",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: `You are a coding assistant. Project path: ${projectPath}` },
+            { role: "user", content: prompt },
+          ],
+          stream: true,
+        }),
+        signal,
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`Copilot API error (${resp.status}): ${text}`);
+      }
+
+      await parseSSEStream(resp.body!, logStream, signal, taskId);
+      markOAuthAccountSuccess(account.id!);
+      if (i > 0 && autoSwap && account.id) {
+        setActiveOAuthAccount("github", account.id);
+        const swapMsg = `[copilot] Promoted account in active pool: ${accountName}\n`;
+        logStream.write(swapMsg);
+        if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: swapMsg });
+      }
+      logStream.write(`\n---\n[copilot] Done.\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "\n---\n[copilot] Done.\n" });
+      return;
+    } catch (err: any) {
+      if (signal.aborted || err?.name === "AbortError") throw err;
+      const msg = err?.message ? String(err.message) : String(err);
+      markOAuthAccountFailure(account.id!, msg);
+      const failMsg = `[copilot] Account ${accountName} failed: ${msg}\n`;
+      logStream.write(failMsg);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: failMsg });
+      lastError = err instanceof Error ? err : new Error(msg);
+      if (autoSwap && i + 1 < maxAttempts) {
+        const nextName = getOAuthAccountDisplayName(accounts[i + 1]);
+        const swapMsg = `[copilot] Trying fallback account: ${nextName}\n`;
+        logStream.write(swapMsg);
+        if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: swapMsg });
+      }
+    }
+  }
+
+  throw lastError ?? new Error("No runnable GitHub Copilot account available.");
 }
 
 async function executeAntigravityAgent(
@@ -2544,62 +3067,103 @@ async function executeAntigravityAgent(
   logStream: fs.WriteStream,
   signal: AbortSignal,
   taskId?: string,
+  preferredAccountId?: string | null,
 ): Promise<void> {
   const modelConfig = getProviderModelConfig();
-  const rawModel = modelConfig.antigravity?.model || "google/antigravity-gemini-2.5-pro";
-  let model = rawModel;
-  if (model.includes("antigravity-")) {
-    model = model.slice(model.indexOf("antigravity-") + "antigravity-".length);
-  } else if (model.includes("/")) {
-    model = model.split("/").pop()!;
+  const defaultRawModel = modelConfig.antigravity?.model || "google/antigravity-gemini-2.5-pro";
+  const autoSwap = getOAuthAutoSwapEnabled();
+  const preferred = getPreferredOAuthAccounts("google_antigravity")
+    .filter((a) => Boolean(a.accessToken || a.refreshToken));
+  const baseAccounts = prioritizeOAuthAccount(preferred, preferredAccountId);
+  const hasPinnedAccount = Boolean(preferredAccountId) && baseAccounts.some((a) => a.id === preferredAccountId);
+  const accounts = hasPinnedAccount ? baseAccounts : rotateOAuthAccounts("google_antigravity", baseAccounts);
+  if (accounts.length === 0) {
+    throw new Error("No Google OAuth token found. Connect Antigravity first.");
   }
 
-  const cred = getDecryptedOAuthToken("google_antigravity");
-  if (!cred?.accessToken) throw new Error("No Google OAuth token found. Connect Antigravity first.");
+  const maxAttempts = autoSwap ? accounts.length : Math.min(accounts.length, 1);
+  let lastError: Error | null = null;
 
-  logStream.write(`[antigravity] Refreshing token...\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[antigravity] Refreshing token...\n" });
-  const accessToken = await refreshGoogleToken(cred);
+  for (let i = 0; i < maxAttempts; i += 1) {
+    const account = accounts[i];
+    const accountName = getOAuthAccountDisplayName(account);
+    const rawModel = account.modelOverride || defaultRawModel;
+    const model = resolveAntigravityModel(rawModel);
 
-  logStream.write(`[antigravity] Discovering project...\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[antigravity] Discovering project...\n" });
-  const projectId = await loadCodeAssistProject(accessToken, signal);
-  logStream.write(`[antigravity] Model: ${model}, Project: ${projectId}\n---\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: `[antigravity] Model: ${model}, Project: ${projectId}\n---\n` });
+    const header = `[antigravity] Account: ${accountName}${account.modelOverride ? ` (model override: ${rawModel})` : ""}\n`;
+    logStream.write(header);
+    if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: header });
 
-  const baseEndpoint = ANTIGRAVITY_ENDPOINTS[0];
-  const url = `${baseEndpoint}/v1internal:streamGenerateContent?alt=sse`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-      "User-Agent": `antigravity/1.15.8 ${process.platform === "darwin" ? "darwin/arm64" : "linux/amd64"}`,
-      "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-      "Client-Metadata": JSON.stringify({ ideType: "ANTIGRAVITY", platform: process.platform === "win32" ? "WINDOWS" : "MACOS", pluginType: "GEMINI" }),
-    },
-    body: JSON.stringify({
-      project: projectId,
-      model,
-      requestType: "agent",
-      userAgent: "antigravity",
-      requestId: `agent-${randomUUID()}`,
-      request: {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      },
-    }),
-    signal,
-  });
+    try {
+      logStream.write(`[antigravity] Refreshing token...\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[antigravity] Refreshing token...\n" });
+      const accessToken = await refreshGoogleToken(account);
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Antigravity API error (${resp.status}): ${text}`);
+      logStream.write(`[antigravity] Discovering project...\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "[antigravity] Discovering project...\n" });
+      const projectId = await loadCodeAssistProject(accessToken, signal);
+      logStream.write(`[antigravity] Model: ${model}, Project: ${projectId}\n---\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: `[antigravity] Model: ${model}, Project: ${projectId}\n---\n` });
+
+      const baseEndpoint = ANTIGRAVITY_ENDPOINTS[0];
+      const url = `${baseEndpoint}/v1internal:streamGenerateContent?alt=sse`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "User-Agent": `antigravity/1.15.8 ${process.platform === "darwin" ? "darwin/arm64" : "linux/amd64"}`,
+          "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+          "Client-Metadata": JSON.stringify({ ideType: "ANTIGRAVITY", platform: process.platform === "win32" ? "WINDOWS" : "MACOS", pluginType: "GEMINI" }),
+        },
+        body: JSON.stringify({
+          project: projectId,
+          model,
+          requestType: "agent",
+          userAgent: "antigravity",
+          requestId: `agent-${randomUUID()}`,
+          request: {
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+          },
+        }),
+        signal,
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`Antigravity API error (${resp.status}): ${text}`);
+      }
+
+      await parseGeminiSSEStream(resp.body!, logStream, signal, taskId);
+      markOAuthAccountSuccess(account.id!);
+      if (i > 0 && autoSwap && account.id) {
+        setActiveOAuthAccount("google_antigravity", account.id);
+        const swapMsg = `[antigravity] Promoted account in active pool: ${accountName}\n`;
+        logStream.write(swapMsg);
+        if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: swapMsg });
+      }
+      logStream.write(`\n---\n[antigravity] Done.\n`);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "\n---\n[antigravity] Done.\n" });
+      return;
+    } catch (err: any) {
+      if (signal.aborted || err?.name === "AbortError") throw err;
+      const msg = err?.message ? String(err.message) : String(err);
+      markOAuthAccountFailure(account.id!, msg);
+      const failMsg = `[antigravity] Account ${accountName} failed: ${msg}\n`;
+      logStream.write(failMsg);
+      if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: failMsg });
+      lastError = err instanceof Error ? err : new Error(msg);
+      if (autoSwap && i + 1 < maxAttempts) {
+        const nextName = getOAuthAccountDisplayName(accounts[i + 1]);
+        const swapMsg = `[antigravity] Trying fallback account: ${nextName}\n`;
+        logStream.write(swapMsg);
+        if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: swapMsg });
+      }
+    }
   }
 
-  await parseGeminiSSEStream(resp.body!, logStream, signal, taskId);
-  logStream.write(`\n---\n[antigravity] Done.\n`);
-  if (taskId) broadcast("cli_output", { task_id: taskId, stream: "stderr", data: "\n---\n[antigravity] Done.\n" });
+  throw lastError ?? new Error("No runnable Antigravity account available.");
 }
 
 function launchHttpAgent(
@@ -2610,6 +3174,7 @@ function launchHttpAgent(
   logPath: string,
   controller: AbortController,
   fakePid: number,
+  preferredOAuthAccountId?: string | null,
 ): void {
   const logStream = fs.createWriteStream(logPath, { flags: "w" });
 
@@ -2627,20 +3192,34 @@ function launchHttpAgent(
     let exitCode = 0;
     try {
       if (agent === "copilot") {
-        await executeCopilotAgent(prompt, projectPath, logStream, controller.signal, taskId);
+        await executeCopilotAgent(
+          prompt,
+          projectPath,
+          logStream,
+          controller.signal,
+          taskId,
+          preferredOAuthAccountId ?? null,
+        );
       } else {
-        await executeAntigravityAgent(prompt, logStream, controller.signal, taskId);
+        await executeAntigravityAgent(
+          prompt,
+          logStream,
+          controller.signal,
+          taskId,
+          preferredOAuthAccountId ?? null,
+        );
       }
     } catch (err: any) {
       exitCode = 1;
       if (err.name !== "AbortError") {
-        const msg = `[${agent}] Error: ${err.message}\n`;
+        const msg = normalizeStreamChunk(`[${agent}] Error: ${err.message}\n`);
         logStream.write(msg);
         broadcast("cli_output", { task_id: taskId, stream: "stderr", data: msg });
         console.error(`[Claw-Empire] HTTP agent error (${agent}, task ${taskId}): ${err.message}`);
       } else {
-        logStream.write(`[${agent}] Aborted by user\n`);
-        broadcast("cli_output", { task_id: taskId, stream: "stderr", data: `[${agent}] Aborted by user\n` });
+        const msg = normalizeStreamChunk(`[${agent}] Aborted by user\n`);
+        logStream.write(msg);
+        broadcast("cli_output", { task_id: taskId, stream: "stderr", data: msg });
       }
     } finally {
       await new Promise<void>((resolve) => logStream.end(resolve));
@@ -4667,10 +5246,46 @@ app.patch("/api/agents/:id", (req, res) => {
   const existing = db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   if (!existing) return res.status(404).json({ error: "not_found" });
 
-  const body = req.body ?? {};
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const nextProviderRaw = ("cli_provider" in body ? body.cli_provider : existing.cli_provider) as string | null | undefined;
+  const nextProvider = nextProviderRaw ?? "claude";
+  const nextOAuthProvider = nextProvider === "copilot"
+    ? "github"
+    : nextProvider === "antigravity"
+    ? "google_antigravity"
+    : null;
+
+  if (!nextOAuthProvider && !("oauth_account_id" in body) && ("cli_provider" in body)) {
+    // Auto-clear pinned OAuth account when switching to non-OAuth provider.
+    body.oauth_account_id = null;
+  }
+
+  if ("oauth_account_id" in body) {
+    if (body.oauth_account_id === "" || typeof body.oauth_account_id === "undefined") {
+      body.oauth_account_id = null;
+    }
+    if (body.oauth_account_id !== null && typeof body.oauth_account_id !== "string") {
+      return res.status(400).json({ error: "invalid_oauth_account_id" });
+    }
+    if (body.oauth_account_id && !nextOAuthProvider) {
+      return res.status(400).json({ error: "oauth_account_requires_oauth_provider" });
+    }
+    if (body.oauth_account_id && nextOAuthProvider) {
+      const oauthAccount = db.prepare(
+        "SELECT id, status FROM oauth_accounts WHERE id = ? AND provider = ?"
+      ).get(body.oauth_account_id, nextOAuthProvider) as { id: string; status: "active" | "disabled" } | undefined;
+      if (!oauthAccount) {
+        return res.status(400).json({ error: "oauth_account_not_found_for_provider" });
+      }
+      if (oauthAccount.status !== "active") {
+        return res.status(400).json({ error: "oauth_account_disabled" });
+      }
+    }
+  }
+
   const allowedFields = [
     "name", "name_ko", "department_id", "role", "cli_provider",
-    "avatar_emoji", "personality", "status", "current_task_id",
+    "oauth_account_id", "avatar_emoji", "personality", "status", "current_task_id",
   ];
 
   const updates: string[] = [];
@@ -4701,6 +5316,7 @@ app.post("/api/agents/:id/spawn", (req, res) => {
     id: string;
     name: string;
     cli_provider: string | null;
+    oauth_account_id: string | null;
     current_task_id: string | null;
     status: string;
   } | undefined;
@@ -4748,7 +5364,7 @@ app.post("/api/agents/:id/spawn", (req, res) => {
     broadcast("agent_status", updatedAgent);
     broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
     notifyTaskStatus(taskId, task.title, "in_progress");
-    launchHttpAgent(taskId, provider, prompt, projectPath, logPath, controller, fakePid);
+    launchHttpAgent(taskId, provider, prompt, projectPath, logPath, controller, fakePid, agent.oauth_account_id ?? null);
     return res.json({ ok: true, pid: fakePid, logPath, cwd: projectPath });
   }
 
@@ -5251,6 +5867,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
     name_ko: string | null;
     role: string;
     cli_provider: string | null;
+    oauth_account_id: string | null;
     personality: string | null;
     department_id: string | null;
     department_name: string | null;
@@ -5352,7 +5969,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
     const taskRow = db.prepare("SELECT department_id FROM tasks WHERE id = ?").get(id) as { department_id: string | null } | undefined;
     startProgressTimer(id, task.title, taskRow?.department_id ?? null);
 
-    launchHttpAgent(id, provider, prompt, agentCwd, logPath, controller, fakePid);
+    launchHttpAgent(id, provider, prompt, agentCwd, logPath, controller, fakePid, agent.oauth_account_id ?? null);
     return res.json({ ok: true, pid: fakePid, logPath, cwd: agentCwd, worktree: !!worktreePath });
   }
 
@@ -5516,6 +6133,7 @@ interface AgentRow {
   current_task_id: string | null;
   avatar_emoji: string;
   cli_provider: string | null;
+  oauth_account_id: string | null;
 }
 
 const ROLE_PRIORITY: Record<string, number> = {
@@ -8253,7 +8871,17 @@ app.get("/api/stats", (_req, res) => {
 // ---------------------------------------------------------------------------
 function prettyStreamJson(raw: string): string {
   const chunks: string[] = [];
-  const meta: string[] = [];
+  let sawJson = false;
+  const pushMessageChunk = (text: string): void => {
+    if (!text) return;
+    if (chunks.length > 0 && !chunks[chunks.length - 1].endsWith("\n")) {
+      chunks.push("\n");
+    }
+    chunks.push(text);
+    if (!text.endsWith("\n")) {
+      chunks.push("\n");
+    }
+  };
 
   for (const line of raw.split(/\r?\n/)) {
     const t = line.trim();
@@ -8262,39 +8890,17 @@ function prettyStreamJson(raw: string): string {
 
     try {
       const j: any = JSON.parse(t);
-
-      // Claude: system init
-      if (j.type === "system" && j.subtype === "init") {
-        meta.push(`[init] cwd=${j.cwd} model=${j.model}`);
-        if (Array.isArray(j.mcp_servers)) {
-          const failed = j.mcp_servers.filter((s: any) => s.status && s.status !== "ok");
-          if (failed.length) meta.push(`[mcp] ${failed.map((s: any) => `${s.name}:${s.status}`).join(", ")}`);
-        }
-        continue;
-      }
-
-      // Gemini: init
-      if (j.type === "init" && j.session_id) {
-        meta.push(`[init] session=${j.session_id} model=${j.model}`);
-        continue;
-      }
-
-      // Claude: skip noise types
-      if (j.type === "user" || j.type === "rate_limit_event") continue;
+      sawJson = true;
 
       // Claude: stream_event
       if (j.type === "stream_event") {
         const ev = j.event;
         if (ev?.type === "content_block_delta" && ev?.delta?.type === "text_delta") {
-          chunks.push(ev.delta.text);
+          chunks.push(String(ev.delta.text ?? ""));
           continue;
         }
         if (ev?.type === "content_block_start" && ev?.content_block?.type === "text" && ev?.content_block?.text) {
-          chunks.push(ev.content_block.text);
-          continue;
-        }
-        if (ev?.type === "content_block_start" && ev?.content_block?.type === "tool_use") {
-          chunks.push(`\n[tool: ${ev.content_block.name}]\n`);
+          chunks.push(String(ev.content_block.text));
           continue;
         }
         continue;
@@ -8302,98 +8908,58 @@ function prettyStreamJson(raw: string): string {
 
       // Claude: assistant message (from --print mode)
       if (j.type === "assistant" && j.message?.content) {
+        let assistantText = "";
         for (const block of j.message.content) {
           if (block.type === "text" && block.text) {
-            chunks.push(block.text);
-          }
-          if (block.type === "tool_use" && block.name) {
-            const inp = block.input || {};
-            const key = inp.file_path || inp.command || inp.pattern || inp.description || inp.prompt || "";
-            const short = String(key).split("\n")[0].slice(0, 120);
-            chunks.push(`\n[tool: ${block.name}] ${short}\n`);
-          }
-          if (block.type === "thinking" && block.thinking) {
-            chunks.push(`\n[thinking] ${block.thinking}\n`);
+            assistantText += String(block.text);
           }
         }
+        pushMessageChunk(assistantText);
         continue;
       }
 
       // Claude: result (final output from --print mode)
       if (j.type === "result" && j.result) {
-        chunks.push(j.result);
+        pushMessageChunk(String(j.result));
         continue;
       }
 
       // Gemini: message with content
       if (j.type === "message" && j.role === "assistant" && j.content) {
-        chunks.push(j.content);
+        pushMessageChunk(String(j.content));
         continue;
       }
 
       // Gemini: tool_use
-      if (j.type === "tool_use" && j.tool_name) {
-        const params = j.parameters?.file_path || j.parameters?.command || "";
-        chunks.push(`\n[tool: ${j.tool_name}] ${params}\n`);
-        continue;
-      }
-
-      // Gemini: tool_result
-      if (j.type === "tool_result" && j.status) {
-        if (j.status !== "success") {
-          chunks.push(`[result: ${j.status}]\n`);
-        }
-        continue;
-      }
-
-      // Codex: thread.started
-      if (j.type === "thread.started" && j.thread_id) {
-        meta.push(`[thread] ${j.thread_id}`);
-        continue;
-      }
-
-      // Codex: item.completed (reasoning, agent_message, or collab)
+      // Codex: item.completed (agent text only)
       if (j.type === "item.completed" && j.item) {
         const item = j.item;
         if (item.type === "agent_message" && item.text) {
-          chunks.push(item.text);
-        } else if (item.type === "reasoning" && item.text) {
-          chunks.push(`\n[reasoning] ${item.text}\n`);
-        } else if (item.type === "tool_call" && item.name) {
-          const args = item.arguments ? JSON.stringify(item.arguments).slice(0, 100) : "";
-          chunks.push(`\n[tool: ${item.name}] ${args}\n`);
-        } else if (item.type === "tool_output" && item.output) {
-          const out = String(item.output);
-          if (out.includes("error") || out.length < 200) {
-            chunks.push(`[output] ${out.slice(0, 200)}\n`);
-          }
-        } else if (item.type === "collab_tool_call") {
-          if (item.tool === "spawn_agent" && item.prompt) {
-            chunks.push(`\n[spawn_agent] ${String(item.prompt).split("\n")[0].slice(0, 80)}\n`);
-          } else if (item.tool === "close_agent") {
-            for (const [, st] of Object.entries(item.agents_states || {})) {
-              const state = st as Record<string, unknown>;
-              if (state.message) chunks.push(`[agent_done] ${String(state.message).slice(0, 100)}\n`);
+          pushMessageChunk(String(item.text));
+        }
+        continue;
+      }
+
+      // OpenCode/json-style assistant payload fallback
+      if (j.role === "assistant") {
+        if (typeof j.content === "string") {
+          pushMessageChunk(j.content);
+        } else if (Array.isArray(j.content)) {
+          const parts: string[] = [];
+          for (const part of j.content) {
+            if (typeof part === "string") {
+              parts.push(part);
+            } else if (part && typeof part.text === "string") {
+              parts.push(part.text);
             }
           }
-          // "wait" tool: silent
+          pushMessageChunk(parts.join("\n"));
         }
         continue;
       }
 
-      // Codex: item.started (collab_tool_call display)
-      if (j.type === "item.started" && j.item) {
-        const item = j.item;
-        if (item.type === "collab_tool_call" && item.tool === "spawn_agent" && item.prompt) {
-          chunks.push(`\n[spawn_agent] ${String(item.prompt).split("\n")[0].slice(0, 80)}\n`);
-        }
-        continue;
-      }
-
-      // Codex: turn.completed (usage stats)
-      if (j.type === "turn.completed" && j.usage) {
-        const u = j.usage;
-        meta.push(`[usage] in=${u.input_tokens} out=${u.output_tokens} cached=${u.cached_input_tokens || 0}`);
+      if (typeof j.text === "string" && (j.type === "assistant_message" || j.type === "output_text")) {
+        pushMessageChunk(j.text);
         continue;
       }
     } catch {
@@ -8401,22 +8967,19 @@ function prettyStreamJson(raw: string): string {
     }
   }
 
-  // Fallback: if no JSON was parsed, return raw text (e.g. plain-text logs)
-  if (chunks.length === 0 && meta.length === 0) {
+  // If log is not structured JSON, return plain text as-is.
+  if (!sawJson) {
     return raw.trim();
   }
 
   const stitched = chunks.join("");
-  const PARA = "\u0000";
-  const withPara = stitched.replace(/\n{2,}/g, PARA);
-  const singleLine = withPara.replace(/\n/g, " ");
-  const normalized = singleLine
-    .replace(/\s+/g, " ")
-    .replace(new RegExp(PARA, "g"), "\n\n")
+  const normalized = stitched
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
     .trim();
 
-  const head = meta.length ? meta.join("\n") + "\n\n" : "";
-  return head + normalized;
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------
@@ -8438,8 +9001,8 @@ app.get("/api/tasks/:id/terminal", (req, res) => {
   let text = tail;
   if (pretty) {
     const parsed = prettyStreamJson(tail);
-    // If pretty parsing produced empty/whitespace but raw has content, fall back to raw
-    text = parsed.trim() ? parsed : tail;
+    // Keep parsed output for structured JSON logs even if it's currently empty (noise-only chunks).
+    text = (parsed.trim() || hasStructuredJsonLines(tail)) ? parsed : tail;
   }
 
   // Also return task_logs (system events) for interleaved display
@@ -8475,7 +9038,11 @@ function upsertOAuthCredential(input: {
   access_token: string;
   refresh_token: string | null;
   expires_at: number | null;
-}): void {
+  label?: string | null;
+  model_override?: string | null;
+  make_active?: boolean;
+}): string {
+  const normalizedProvider = normalizeOAuthProvider(input.provider) ?? input.provider;
   const now = nowMs();
   const accessEnc = encryptSecret(input.access_token);
   const refreshEnc = input.refresh_token ? encryptSecret(input.refresh_token) : null;
@@ -8494,9 +9061,94 @@ function upsertOAuthCredential(input: {
       access_token_enc = excluded.access_token_enc,
       refresh_token_enc = excluded.refresh_token_enc
   `).run(
-    input.provider, input.source, encData, input.email, input.scope,
+    normalizedProvider, input.source, encData, input.email, input.scope,
     input.expires_at, now, now, accessEnc, refreshEnc
   );
+
+  let accountId: string | null = null;
+  if (input.email) {
+    const existing = db.prepare(
+      "SELECT id FROM oauth_accounts WHERE provider = ? AND email = ? ORDER BY updated_at DESC LIMIT 1"
+    ).get(normalizedProvider, input.email) as { id: string } | undefined;
+    if (existing) accountId = existing.id;
+  }
+
+  if (!accountId) {
+    const nextPriority = (db.prepare(
+      "SELECT COALESCE(MAX(priority), 90) + 10 AS p FROM oauth_accounts WHERE provider = ?"
+    ).get(normalizedProvider) as { p: number }).p;
+    const defaultLabel = getNextOAuthLabel(normalizedProvider);
+    accountId = randomUUID();
+    db.prepare(`
+      INSERT INTO oauth_accounts (
+        id, provider, source, label, email, scope, expires_at,
+        access_token_enc, refresh_token_enc, status, priority, model_override,
+        failure_count, last_error, last_error_at, last_success_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, NULL, NULL, ?, ?, ?)
+    `).run(
+      accountId,
+      normalizedProvider,
+      input.source,
+      input.label ?? defaultLabel,
+      input.email,
+      input.scope,
+      input.expires_at,
+      accessEnc,
+      refreshEnc,
+      nextPriority,
+      input.model_override ?? null,
+      now,
+      now,
+      now,
+    );
+  } else {
+    let resolvedLabel: string | null = input.label ?? null;
+    if (!resolvedLabel) {
+      const current = db.prepare(
+        "SELECT label, email FROM oauth_accounts WHERE id = ?"
+      ).get(accountId) as { label: string | null; email: string | null } | undefined;
+      if (!current?.label || (current.email && current.label === current.email)) {
+        resolvedLabel = getNextOAuthLabel(normalizedProvider);
+      }
+    }
+    db.prepare(`
+      UPDATE oauth_accounts
+      SET source = ?,
+          label = COALESCE(?, label),
+          email = ?,
+          scope = ?,
+          expires_at = ?,
+          access_token_enc = ?,
+          refresh_token_enc = ?,
+          model_override = COALESCE(?, model_override),
+          status = 'active',
+          updated_at = ?,
+          last_success_at = ?,
+          failure_count = 0,
+          last_error = NULL,
+          last_error_at = NULL
+      WHERE id = ?
+    `).run(
+      input.source,
+      resolvedLabel,
+      input.email,
+      input.scope,
+      input.expires_at,
+      accessEnc,
+      refreshEnc,
+      input.model_override ?? null,
+      now,
+      now,
+      accountId,
+    );
+  }
+
+  if (input.make_active !== false && accountId) {
+    setActiveOAuthAccount(normalizedProvider, accountId);
+  }
+
+  ensureOAuthActiveAccount(normalizedProvider);
+  return accountId;
 }
 
 function startGitHubOAuth(redirectTo: string | undefined, callbackPath: string): string {
@@ -8663,152 +9315,187 @@ async function handleGoogleAntigravityCallback(code: string, stateId: string, ca
 async function buildOAuthStatus() {
   const home = os.homedir();
 
-  // DB-stored credentials
-  type CredRow = { provider: string; email: string | null; scope: string | null; expires_at: number | null; created_at: number; updated_at: number; access_token_enc: string | null; refresh_token_enc: string | null };
-  const rows = db.prepare(
-    "SELECT provider, email, scope, expires_at, created_at, updated_at, access_token_enc, refresh_token_enc FROM oauth_credentials"
-  ).all() as CredRow[];
-
-  const dbCreds: Record<string, CredRow> = {};
-  for (const row of rows) dbCreds[row.provider] = row;
-
-  // GitHub credential: DB "github" or file-detected from gh CLI
-  const ghDb = dbCreds.github;
-  let ghConnected = Boolean(ghDb);
-  let ghSource: string | null = ghDb ? "web-oauth" : null;
-  let ghEmail: string | null = ghDb?.email ?? null;
-  let ghScope: string | null = ghDb?.scope ?? null;
-  let ghCreatedAt = ghDb?.created_at ?? 0;
-  let ghUpdatedAt = ghDb?.updated_at ?? 0;
-  const ghHasRefresh = Boolean(ghDb?.refresh_token_enc);
-
-  // Also detect Copilot file-based credentials
-  if (!ghConnected) {
-    // gh CLI hosts
-    try {
-      const hostsPath = path.join(home, ".config", "gh", "hosts.yml");
-      const raw = fs.readFileSync(hostsPath, "utf8");
-      const userMatch = raw.match(/user:\s*(\S+)/);
-      if (userMatch) {
-        const stat = fs.statSync(hostsPath);
-        ghConnected = true;
-        ghSource = "file-detected";
-        ghEmail = userMatch[1];
-        ghScope = "github.com";
-        ghCreatedAt = stat.birthtimeMs;
-        ghUpdatedAt = stat.mtimeMs;
-      }
-    } catch {}
-  }
-  if (!ghConnected) {
-    // GitHub Copilot hosts/apps
-    const copilotPaths = [
-      path.join(home, ".config", "github-copilot", "hosts.json"),
-      path.join(home, ".config", "github-copilot", "apps.json"),
-    ];
-    for (const cp of copilotPaths) {
+  const detectFileCredential = (provider: "github" | "google_antigravity") => {
+    if (provider === "github") {
       try {
-        const raw = JSON.parse(fs.readFileSync(cp, "utf8"));
-        if (raw && typeof raw === "object" && Object.keys(raw).length > 0) {
-          const stat = fs.statSync(cp);
-          const firstKey = Object.keys(raw)[0];
-          ghConnected = true;
-          ghSource = "file-detected";
-          ghEmail = raw[firstKey]?.user ?? null;
-          ghScope = "copilot";
-          ghCreatedAt = stat.birthtimeMs;
-          ghUpdatedAt = stat.mtimeMs;
-          break;
+        const hostsPath = path.join(home, ".config", "gh", "hosts.yml");
+        const raw = fs.readFileSync(hostsPath, "utf8");
+        const userMatch = raw.match(/user:\s*(\S+)/);
+        if (userMatch) {
+          const stat = fs.statSync(hostsPath);
+          return {
+            detected: true,
+            source: "file-detected",
+            email: userMatch[1],
+            scope: "github.com",
+            created_at: stat.birthtimeMs,
+            updated_at: stat.mtimeMs,
+          };
         }
       } catch {}
-    }
-  }
 
-  // Antigravity credential: DB "google_antigravity" or file-detected
-  const agDb = dbCreds.google_antigravity;
-  let agConnected = Boolean(agDb);
-  let agSource: string | null = agDb ? "web-oauth" : null;
-  let agEmail: string | null = agDb?.email ?? null;
-  let agScope: string | null = agDb?.scope ?? null;
-  let agExpiresAt: number | null = agDb?.expires_at ?? null;
-  let agCreatedAt = agDb?.created_at ?? 0;
-  let agUpdatedAt = agDb?.updated_at ?? 0;
-  const agHasRefresh = Boolean(agDb?.refresh_token_enc);
-  let agRefreshFailed = false;
-  let agLastRefreshed: number | null = null;
-
-  if (!agConnected) {
-    const agPaths = [
-      path.join(home, ".antigravity", "auth.json"),
-      path.join(home, ".config", "antigravity", "auth.json"),
-      path.join(home, ".config", "antigravity", "credentials.json"),
-    ];
-    for (const ap of agPaths) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(ap, "utf8"));
-        if (raw && typeof raw === "object") {
-          const stat = fs.statSync(ap);
-          agConnected = true;
-          agSource = "file-detected";
-          agEmail = raw.email ?? raw.user ?? null;
-          agScope = raw.scope ?? null;
-          agExpiresAt = raw.expires_at ?? null;
-          agCreatedAt = stat.birthtimeMs;
-          agUpdatedAt = stat.mtimeMs;
-          break;
-        }
-      } catch {}
-    }
-  }
-
-  // Auto-refresh expired Antigravity token if refresh token is available
-  if (agConnected && agHasRefresh && agExpiresAt && agExpiresAt < Date.now()) {
-    const cred = getDecryptedOAuthToken("google_antigravity");
-    if (cred) {
-      try {
-        await refreshGoogleToken(cred);
-        // Re-read updated row from DB
-        const updatedRow = db.prepare(
-          "SELECT expires_at, updated_at FROM oauth_credentials WHERE provider = 'google_antigravity'"
-        ).get() as { expires_at: number | null; updated_at: number } | undefined;
-        if (updatedRow) {
-          agExpiresAt = updatedRow.expires_at;
-          agUpdatedAt = updatedRow.updated_at;
-          agLastRefreshed = Date.now();
-        }
-        console.log("[oauth] Auto-refreshed Antigravity token on status check");
-      } catch (err) {
-        agRefreshFailed = true;
-        console.error("[oauth] Auto-refresh failed for Antigravity:", err instanceof Error ? err.message : err);
+      const copilotPaths = [
+        path.join(home, ".config", "github-copilot", "hosts.json"),
+        path.join(home, ".config", "github-copilot", "apps.json"),
+      ];
+      for (const cp of copilotPaths) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(cp, "utf8"));
+          if (raw && typeof raw === "object" && Object.keys(raw).length > 0) {
+            const stat = fs.statSync(cp);
+            const firstKey = Object.keys(raw)[0];
+            return {
+              detected: true,
+              source: "file-detected",
+              email: raw[firstKey]?.user ?? null,
+              scope: "copilot",
+              created_at: stat.birthtimeMs,
+              updated_at: stat.mtimeMs,
+            };
+          }
+        } catch {}
+      }
+    } else {
+      const agPaths = [
+        path.join(home, ".antigravity", "auth.json"),
+        path.join(home, ".config", "antigravity", "auth.json"),
+        path.join(home, ".config", "antigravity", "credentials.json"),
+      ];
+      for (const ap of agPaths) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(ap, "utf8"));
+          if (raw && typeof raw === "object") {
+            const stat = fs.statSync(ap);
+            return {
+              detected: true,
+              source: "file-detected",
+              email: raw.email ?? raw.user ?? null,
+              scope: raw.scope ?? null,
+              created_at: stat.birthtimeMs,
+              updated_at: stat.mtimeMs,
+            };
+          }
+        } catch {}
       }
     }
-  }
+    return {
+      detected: false,
+      source: null as string | null,
+      email: null as string | null,
+      scope: null as string | null,
+      created_at: 0,
+      updated_at: 0,
+    };
+  };
+
+  const buildProviderStatus = (internalProvider: "github" | "google_antigravity") => {
+    ensureOAuthActiveAccount(internalProvider);
+    let activeAccountIds = getActiveOAuthAccountIds(internalProvider);
+    let activeSet = new Set(activeAccountIds);
+
+    const rows = db.prepare(`
+      SELECT
+        id, label, email, source, scope, status, priority, expires_at,
+        refresh_token_enc, model_override, failure_count, last_error, last_error_at, last_success_at, created_at, updated_at
+      FROM oauth_accounts
+      WHERE provider = ?
+      ORDER BY priority ASC, updated_at DESC
+    `).all(internalProvider) as Array<{
+      id: string;
+      label: string | null;
+      email: string | null;
+      source: string | null;
+      scope: string | null;
+      status: string;
+      priority: number;
+      expires_at: number | null;
+      refresh_token_enc: string | null;
+      model_override: string | null;
+      failure_count: number;
+      last_error: string | null;
+      last_error_at: number | null;
+      last_success_at: number | null;
+      created_at: number;
+      updated_at: number;
+    }>;
+
+    const decryptedById = new Map(
+      getOAuthAccounts(internalProvider, true).map((a) => [a.id as string, a]),
+    );
+    const accounts = rows.map((row) => {
+      const dec = decryptedById.get(row.id);
+      const expiresAtMs = row.expires_at && row.expires_at < 1e12 ? row.expires_at * 1000 : row.expires_at;
+      const hasRefreshToken = Boolean(dec?.refreshToken);
+      const hasFreshAccessToken = Boolean(dec?.accessToken) && (!expiresAtMs || expiresAtMs > Date.now() + 60_000);
+      const executionReady = row.status === "active" && (hasFreshAccessToken || hasRefreshToken);
+      return {
+        id: row.id,
+        label: row.label,
+        email: row.email,
+        source: row.source,
+        scope: row.scope,
+        status: row.status as "active" | "disabled",
+        priority: row.priority,
+        expires_at: row.expires_at,
+        hasRefreshToken,
+        executionReady,
+        active: activeSet.has(row.id),
+        modelOverride: row.model_override,
+        failureCount: row.failure_count,
+        lastError: row.last_error,
+        lastErrorAt: row.last_error_at,
+        lastSuccessAt: row.last_success_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      };
+    });
+
+    if (accounts.length > 0) {
+      const activeIdsPresent = activeAccountIds.filter((id) => accounts.some((a) => a.id === id && a.status === "active"));
+      if (activeIdsPresent.length === 0) {
+        const fallback = accounts.find((a) => a.status === "active");
+        if (fallback) {
+          setActiveOAuthAccount(internalProvider, fallback.id);
+          activeAccountIds = getActiveOAuthAccountIds(internalProvider);
+        }
+      } else if (activeIdsPresent.length !== activeAccountIds.length) {
+        setOAuthActiveAccounts(internalProvider, activeIdsPresent);
+        activeAccountIds = activeIdsPresent;
+      }
+    }
+    activeSet = new Set(activeAccountIds);
+    const activeAccountId = activeAccountIds[0] ?? null;
+    const accountsWithActive = accounts.map((a) => ({ ...a, active: activeSet.has(a.id) }));
+    const runnable = accountsWithActive.filter((a) => a.executionReady);
+    const primary = accountsWithActive.find((a) => a.active) ?? runnable[0] ?? accountsWithActive[0] ?? null;
+    const fileDetected = detectFileCredential(internalProvider);
+    const detected = accountsWithActive.length > 0 || fileDetected.detected;
+    const connected = runnable.length > 0;
+
+    return {
+      connected,
+      detected,
+      executionReady: connected,
+      requiresWebOAuth: detected && !connected,
+      source: primary?.source ?? fileDetected.source,
+      email: primary?.email ?? fileDetected.email,
+      scope: primary?.scope ?? fileDetected.scope,
+      expires_at: primary?.expires_at ?? null,
+      created_at: primary?.created_at ?? fileDetected.created_at,
+      updated_at: primary?.updated_at ?? fileDetected.updated_at,
+      webConnectable: true,
+      hasRefreshToken: primary?.hasRefreshToken ?? false,
+      refreshFailed: primary?.lastError ? true : undefined,
+      lastRefreshed: primary?.lastSuccessAt ?? null,
+      activeAccountId,
+      activeAccountIds,
+      accounts: accountsWithActive,
+    };
+  };
 
   return {
-    "github-copilot": {
-      connected: ghConnected,
-      source: ghSource,
-      email: ghEmail,
-      scope: ghScope,
-      expires_at: null as number | null,
-      created_at: ghCreatedAt,
-      updated_at: ghUpdatedAt,
-      webConnectable: true,  // always connectable — built-in client ID
-      hasRefreshToken: ghHasRefresh,
-    },
-    antigravity: {
-      connected: agConnected,
-      source: agSource,
-      email: agEmail,
-      scope: agScope,
-      expires_at: agExpiresAt,
-      created_at: agCreatedAt,
-      updated_at: agUpdatedAt,
-      webConnectable: true,  // always connectable — built-in client ID
-      hasRefreshToken: agHasRefresh,
-      refreshFailed: agRefreshFailed || undefined,
-      lastRefreshed: agLastRefreshed,
-    },
+    "github-copilot": buildProviderStatus("github"),
+    antigravity: buildProviderStatus("google_antigravity"),
   };
 }
 
@@ -9028,24 +9715,45 @@ app.post("/api/oauth/github-copilot/device-poll", async (req, res) => {
 
 // POST /api/oauth/disconnect — Disconnect a provider
 app.post("/api/oauth/disconnect", (req, res) => {
-  const provider = (req.body as { provider?: string })?.provider;
-  if (provider === "github-copilot") {
-    db.prepare("DELETE FROM oauth_credentials WHERE provider = ?").run("github");
-  } else if (provider === "antigravity") {
-    db.prepare("DELETE FROM oauth_credentials WHERE provider = ?").run("google_antigravity");
-  } else {
+  const body = (req.body as { provider?: string; account_id?: string }) ?? {};
+  const provider = normalizeOAuthProvider(body.provider ?? "");
+  const accountId = body.account_id;
+  if (!provider) {
     return res.status(400).json({ error: `Invalid provider: ${provider}` });
   }
+
+  if (accountId) {
+    db.prepare("DELETE FROM oauth_accounts WHERE id = ? AND provider = ?").run(accountId, provider);
+    ensureOAuthActiveAccount(provider);
+    const remaining = (db.prepare(
+      "SELECT COUNT(*) as cnt FROM oauth_accounts WHERE provider = ?"
+    ).get(provider) as { cnt: number }).cnt;
+    if (remaining === 0) {
+      db.prepare("DELETE FROM oauth_credentials WHERE provider = ?").run(provider);
+      db.prepare("DELETE FROM oauth_active_accounts WHERE provider = ?").run(provider);
+    }
+  } else {
+    db.prepare("DELETE FROM oauth_accounts WHERE provider = ?").run(provider);
+    db.prepare("DELETE FROM oauth_active_accounts WHERE provider = ?").run(provider);
+    db.prepare("DELETE FROM oauth_credentials WHERE provider = ?").run(provider);
+  }
+
   res.json({ ok: true });
 });
 
 // POST /api/oauth/refresh — Manually refresh an OAuth token
 app.post("/api/oauth/refresh", async (req, res) => {
-  const provider = (req.body as { provider?: string })?.provider;
-  if (provider !== "antigravity") {
+  const body = (req.body as { provider?: string; account_id?: string }) ?? {};
+  const provider = normalizeOAuthProvider(body.provider ?? "");
+  if (provider !== "google_antigravity") {
     return res.status(400).json({ error: `Unsupported provider for refresh: ${provider}` });
   }
-  const cred = getDecryptedOAuthToken("google_antigravity");
+  let cred: DecryptedOAuthToken | null = null;
+  if (body.account_id) {
+    cred = getOAuthAccounts(provider, true).find((a) => a.id === body.account_id) ?? null;
+  } else {
+    cred = getPreferredOAuthAccounts(provider)[0] ?? null;
+  }
   if (!cred) {
     return res.status(404).json({ error: "No credential found for google_antigravity" });
   }
@@ -9055,15 +9763,108 @@ app.post("/api/oauth/refresh", async (req, res) => {
   try {
     await refreshGoogleToken(cred);
     const updatedRow = db.prepare(
-      "SELECT expires_at, updated_at FROM oauth_credentials WHERE provider = 'google_antigravity'"
-    ).get() as { expires_at: number | null; updated_at: number } | undefined;
+      "SELECT expires_at, updated_at FROM oauth_accounts WHERE id = ?"
+    ).get(cred.id) as { expires_at: number | null; updated_at: number } | undefined;
     console.log("[oauth] Manual refresh: Antigravity token renewed");
-    res.json({ ok: true, expires_at: updatedRow?.expires_at ?? null, refreshed_at: Date.now() });
+    res.json({ ok: true, expires_at: updatedRow?.expires_at ?? null, refreshed_at: Date.now(), account_id: cred.id });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[oauth] Manual refresh failed for Antigravity:", msg);
     res.status(500).json({ error: msg });
   }
+});
+
+app.post("/api/oauth/accounts/activate", (req, res) => {
+  const body = (req.body as {
+    provider?: string;
+    account_id?: string;
+    mode?: "exclusive" | "add" | "remove" | "toggle";
+  }) ?? {};
+  const provider = normalizeOAuthProvider(body.provider ?? "");
+  const mode = body.mode ?? "exclusive";
+  if (!provider || !body.account_id) {
+    return res.status(400).json({ error: "provider and account_id are required" });
+  }
+  const account = db.prepare(
+    "SELECT id, status FROM oauth_accounts WHERE id = ? AND provider = ?"
+  ).get(body.account_id, provider) as { id: string; status: "active" | "disabled" } | undefined;
+  if (!account) {
+    return res.status(404).json({ error: "account_not_found" });
+  }
+  if ((mode === "exclusive" || mode === "add" || mode === "toggle") && account.status !== "active") {
+    return res.status(400).json({ error: "account_disabled" });
+  }
+
+  if (mode === "exclusive") {
+    setOAuthActiveAccounts(provider, [body.account_id]);
+  } else if (mode === "add") {
+    setActiveOAuthAccount(provider, body.account_id);
+  } else if (mode === "remove") {
+    removeActiveOAuthAccount(provider, body.account_id);
+  } else if (mode === "toggle") {
+    const activeIds = new Set(getActiveOAuthAccountIds(provider));
+    if (activeIds.has(body.account_id)) {
+      removeActiveOAuthAccount(provider, body.account_id);
+    } else {
+      setActiveOAuthAccount(provider, body.account_id);
+    }
+  } else {
+    return res.status(400).json({ error: "invalid_mode" });
+  }
+
+  const activeIdsAfter = getActiveOAuthAccountIds(provider);
+  if (activeIdsAfter.length === 0 && (mode === "remove" || mode === "toggle")) {
+    const fallback = db.prepare(
+      "SELECT id FROM oauth_accounts WHERE provider = ? AND status = 'active' AND id != ? ORDER BY priority ASC, updated_at DESC LIMIT 1"
+    ).get(provider, body.account_id) as { id: string } | undefined;
+    if (fallback) {
+      setActiveOAuthAccount(provider, fallback.id);
+    } else {
+      ensureOAuthActiveAccount(provider);
+    }
+  } else {
+    ensureOAuthActiveAccount(provider);
+  }
+
+  res.json({ ok: true, activeAccountIds: getActiveOAuthAccountIds(provider) });
+});
+
+app.put("/api/oauth/accounts/:id", (req, res) => {
+  const id = String(req.params.id);
+  const body = (req.body as {
+    label?: string | null;
+    model_override?: string | null;
+    priority?: number;
+    status?: "active" | "disabled";
+  }) ?? {};
+
+  const existing = db.prepare("SELECT id FROM oauth_accounts WHERE id = ?").get(id) as { id: string } | undefined;
+  if (!existing) return res.status(404).json({ error: "account_not_found" });
+
+  const updates: string[] = ["updated_at = ?"];
+  const params: unknown[] = [nowMs()];
+  if ("label" in body) {
+    updates.push("label = ?");
+    params.push(body.label ?? null);
+  }
+  if ("model_override" in body) {
+    updates.push("model_override = ?");
+    params.push(body.model_override ?? null);
+  }
+  if (typeof body.priority === "number" && Number.isFinite(body.priority)) {
+    updates.push("priority = ?");
+    params.push(Math.max(1, Math.round(body.priority)));
+  }
+  if (body.status === "active" || body.status === "disabled") {
+    updates.push("status = ?");
+    params.push(body.status);
+  }
+
+  params.push(id);
+  db.prepare(`UPDATE oauth_accounts SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+  const providerRow = db.prepare("SELECT provider FROM oauth_accounts WHERE id = ?").get(id) as { provider: string };
+  ensureOAuthActiveAccount(providerRow.provider);
+  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------------

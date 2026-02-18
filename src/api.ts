@@ -72,7 +72,10 @@ export async function getMeetingPresence(): Promise<MeetingPresence[]> {
   return j.presence;
 }
 
-export async function updateAgent(id: string, data: Partial<Pick<Agent, 'status' | 'current_task_id' | 'department_id' | 'role' | 'cli_provider' | 'personality'>>): Promise<void> {
+export async function updateAgent(
+  id: string,
+  data: Partial<Pick<Agent, 'status' | 'current_task_id' | 'department_id' | 'role' | 'cli_provider' | 'oauth_account_id' | 'personality'>>,
+): Promise<void> {
   await patch(`/api/agents/${id}`, data);
 }
 
@@ -217,8 +220,32 @@ export async function saveSettings(settings: CompanySettings): Promise<void> {
 }
 
 // OAuth
+export interface OAuthAccountInfo {
+  id: string;
+  label: string | null;
+  email: string | null;
+  source: string | null;
+  scope: string | null;
+  status: "active" | "disabled";
+  priority: number;
+  expires_at: number | null;
+  hasRefreshToken: boolean;
+  executionReady: boolean;
+  active: boolean;
+  modelOverride?: string | null;
+  failureCount?: number;
+  lastError?: string | null;
+  lastErrorAt?: number | null;
+  lastSuccessAt?: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface OAuthProviderStatus {
   connected: boolean;
+  detected?: boolean;
+  executionReady?: boolean;
+  requiresWebOAuth?: boolean;
   source: string | null;
   email: string | null;
   scope: string | null;
@@ -229,6 +256,9 @@ export interface OAuthProviderStatus {
   hasRefreshToken?: boolean;
   refreshFailed?: boolean;
   lastRefreshed?: number | null;
+  activeAccountId?: string | null;
+  activeAccountIds?: string[];
+  accounts?: OAuthAccountInfo[];
 }
 
 export type OAuthConnectProvider = "github-copilot" | "antigravity";
@@ -259,6 +289,28 @@ export interface OAuthRefreshResult {
 
 export async function refreshOAuthToken(provider: OAuthConnectProvider): Promise<OAuthRefreshResult> {
   return post('/api/oauth/refresh', { provider }) as Promise<OAuthRefreshResult>;
+}
+
+export async function activateOAuthAccount(
+  provider: OAuthConnectProvider,
+  accountId: string,
+  mode: "exclusive" | "add" | "remove" | "toggle" = "exclusive",
+): Promise<{ ok: boolean; activeAccountIds?: string[] }> {
+  return post('/api/oauth/accounts/activate', { provider, account_id: accountId, mode }) as Promise<{ ok: boolean; activeAccountIds?: string[] }>;
+}
+
+export async function updateOAuthAccount(
+  accountId: string,
+  patch: { label?: string | null; model_override?: string | null; priority?: number; status?: "active" | "disabled" },
+): Promise<{ ok: boolean }> {
+  return put(`/api/oauth/accounts/${accountId}`, patch) as Promise<{ ok: boolean }>;
+}
+
+export async function deleteOAuthAccount(
+  provider: OAuthConnectProvider,
+  accountId: string,
+): Promise<{ ok: boolean }> {
+  return post('/api/oauth/disconnect', { provider, account_id: accountId }) as Promise<{ ok: boolean }>;
 }
 
 // GitHub Device Code Flow
