@@ -13,19 +13,21 @@ const REMOTION_PATTERNS: SignalPattern[] = [
   { key: "remotion_register_root", regex: /\bregisterRoot\b/i },
 ];
 
-const FORBIDDEN_PATTERNS: SignalPattern[] = [
-  { key: "moviepy", regex: /\bmoviepy\b/gi },
-  { key: "pillow", regex: /\bpillow\b/gi },
-  { key: "pil_import", regex: /\b(?:from\s+PIL|import\s+PIL)\b/gi },
+const FORBIDDEN_USAGE_PATTERNS: SignalPattern[] = [
+  { key: "moviepy_import", regex: /\b(?:from|import)\s+moviepy\b/i },
+  { key: "moviepy_usage", regex: /\bmoviepy\b.{0,48}\b(using|use|render|build|create|available|installed|version)\b/i },
+  { key: "moviepy_usage_rev", regex: /\b(using|use|render|build|create)\b.{0,48}\bmoviepy\b/i },
+  { key: "python_moviepy", regex: /\bpython\b.{0,64}\bmoviepy\b/i },
+  { key: "pillow_import", regex: /\b(?:from|import)\s+PIL\b/i },
+  { key: "pillow_usage", regex: /\bpillow\b.{0,48}\b(using|use|render|build|create|available|installed|version)\b/i },
+  { key: "pillow_usage_rev", regex: /\b(using|use|render|build|create)\b.{0,48}\bpillow\b/i },
+  { key: "python_pillow", regex: /\bpython\b.{0,64}\bpillow\b/i },
 ];
 
-const NEGATION_HINT = /(do not|don't|never|not\s+use|금지|쓰지\s*마|사용\s*금지|禁止|不要)/i;
+const NEGATION_HINT = /(do not|don't|never|not\s+use|forbidden|prohibit|prohibited|not\s+allowed|금지|쓰지\s*마|사용\s*금지|禁止|不要|禁用|不可使用)/i;
 
-function hasNegationHintNearby(source: string, index: number): boolean {
-  const start = Math.max(0, index - 28);
-  const end = Math.min(source.length, index + 18);
-  const windowText = source.slice(start, end);
-  return NEGATION_HINT.test(windowText);
+function hasNegationHint(line: string): boolean {
+  return NEGATION_HINT.test(line);
 }
 
 function detectSignals(text: string): { remotionSignals: string[]; forbiddenSignals: string[] } {
@@ -35,16 +37,15 @@ function detectSignals(text: string): { remotionSignals: string[]; forbiddenSign
   }
 
   const forbiddenSignals = new Set<string>();
-  for (const pattern of FORBIDDEN_PATTERNS) {
-    pattern.regex.lastIndex = 0;
-    let matched = pattern.regex.exec(text);
-    while (matched) {
-      const idx = matched.index ?? 0;
-      if (!hasNegationHintNearby(text, idx)) {
+  const lines = text.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = String(rawLine ?? "");
+    if (!line) continue;
+    if (hasNegationHint(line)) continue;
+    for (const pattern of FORBIDDEN_USAGE_PATTERNS) {
+      if (pattern.regex.test(line)) {
         forbiddenSignals.add(pattern.key);
-        break;
       }
-      matched = pattern.regex.exec(text);
     }
   }
 

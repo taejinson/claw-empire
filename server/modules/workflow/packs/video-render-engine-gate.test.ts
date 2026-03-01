@@ -40,7 +40,11 @@ describe("evaluateRemotionOnlyGateFromLogFiles", () => {
 
   it("fails when python movie renderer signals are present", () => {
     const logsDir = makeLogsDir();
-    fs.writeFileSync(path.join(logsDir, "task-b.log"), "moviepy 2.1.2 is available\nimport PIL\n", "utf8");
+    fs.writeFileSync(
+      path.join(logsDir, "task-b.log"),
+      "Good, moviepy 2.1.2 is available. I'll create a high-quality motion graphics video using Python/moviepy with Pillow.\n",
+      "utf8",
+    );
 
     const result = evaluateRemotionOnlyGateFromLogFiles({ logsDir, taskIds: ["task-b"] });
 
@@ -57,5 +61,23 @@ describe("evaluateRemotionOnlyGateFromLogFiles", () => {
 
     expect(result.forbiddenEngineTaskIds).toEqual([]);
     expect(result.passed).toBe(false);
+  });
+
+  it("does not treat policy ban lines as forbidden-engine usage", () => {
+    const logsDir = makeLogsDir();
+    fs.writeFileSync(
+      path.join(logsDir, "task-d.log"),
+      [
+        "최종 렌더링 엔진은 반드시 Remotion만 사용하세요. Python(moviepy/Pillow) 기반 렌더링은 금지됩니다.",
+        "pnpm exec remotion render src/index.tsx Intro video_output/final.mp4 --log=verbose",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = evaluateRemotionOnlyGateFromLogFiles({ logsDir, taskIds: ["task-d"] });
+
+    expect(result.passed).toBe(true);
+    expect(result.forbiddenEngineTaskIds).toEqual([]);
+    expect(result.remotionEvidenceTaskIds).toEqual(["task-d"]);
   });
 });
